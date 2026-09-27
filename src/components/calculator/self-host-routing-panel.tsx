@@ -134,7 +134,7 @@ export function SelfHostRoutingPanel({
                   </TooltipContent>
                 </Tooltip>
               </Label>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <Slider
                   aria-label="Share of requests that are complex (High), percent"
                   min={5}
@@ -149,9 +149,9 @@ export function SelfHostRoutingPanel({
                       mediumRatePct: Math.min(config.mediumRatePct, maxMedium / 100),
                     });
                   }}
-                  className="max-w-xs"
+                  className="max-w-xs min-w-[120px] flex-1"
                 />
-                <span className="text-sm tabular-nums text-muted-foreground w-10">{highPct}%</span>
+                <span className="text-sm tabular-nums text-muted-foreground w-10 shrink-0 whitespace-nowrap">{highPct}%</span>
               </div>
             </div>
 
@@ -180,7 +180,7 @@ export function SelfHostRoutingPanel({
                 </SelectContent>
               </Select>
               {config.mediumModelId && (
-                <div className="flex items-center gap-3 pt-1">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1">
                   <Slider
                     aria-label="Share of requests sent to the Medium tier, percent"
                     min={0}
@@ -188,9 +188,9 @@ export function SelfHostRoutingPanel({
                     step={5}
                     value={[mediumPct]}
                     onValueChange={([v]) => onChange({ ...config, mediumRatePct: v / 100 })}
-                    className="max-w-xs"
+                    className="max-w-xs min-w-[120px] flex-1"
                   />
-                  <span className="text-sm tabular-nums text-muted-foreground w-10">{mediumPct}%</span>
+                  <span className="text-sm tabular-nums text-muted-foreground w-10 shrink-0 whitespace-nowrap">{mediumPct}%</span>
                 </div>
               )}
             </div>

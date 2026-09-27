@@ -58,13 +58,13 @@ export function OpenSourceModelCatalog({
   }, [filteredModels, workload, sort]);
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 @container">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm font-medium">
           {rows.length} open-source model{rows.length === 1 ? "" : "s"} &middot; select one to
           size your server
         </p>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-1.5">
             <Switch id="oss-task-filter" checked={taskFilterOn} onCheckedChange={setTaskFilterOn} />
             <Label htmlFor="oss-task-filter" className="text-xs text-muted-foreground font-normal">
@@ -72,7 +72,7 @@ export function OpenSourceModelCatalog({
             </Label>
           </div>
           <Select value={sort} onValueChange={(v) => setSort(v as SortMode)}>
-            <SelectTrigger className="w-[190px]" size="sm">
+            <SelectTrigger className="w-full sm:w-[190px]" size="sm">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -84,7 +84,9 @@ export function OpenSourceModelCatalog({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+      {/* Column count is keyed to this grid's own rendered width (container
+          queries), not the viewport - see CommercialModelCatalog for why. */}
+      <div className="grid grid-cols-1 @xl:grid-cols-2 @4xl:grid-cols-3 gap-3">
         {rows.map(({ model, monthlyCost }) => {
           const selected = model.id === selectedId;
           return (

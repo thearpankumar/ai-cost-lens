@@ -167,7 +167,7 @@ export function HostingSelector({ config, onChange, model }: HostingSelectorProp
 
             <div className="space-y-2">
               <Label>Hours running per day</Label>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <Slider
                   aria-label="Hours running per day"
                   min={1}
@@ -175,9 +175,9 @@ export function HostingSelector({ config, onChange, model }: HostingSelectorProp
                   step={1}
                   value={[config.hoursPerDay]}
                   onValueChange={([v]) => onChange({ ...config, hoursPerDay: v })}
-                  className="max-w-xs"
+                  className="max-w-xs min-w-[120px] flex-1"
                 />
-                <span className="text-sm tabular-nums text-muted-foreground w-24">
+                <span className="text-sm tabular-nums text-muted-foreground w-24 shrink-0 whitespace-nowrap">
                   {config.hoursPerDay}h/day
                 </span>
               </div>
@@ -195,7 +195,7 @@ export function HostingSelector({ config, onChange, model }: HostingSelectorProp
                   </TooltipContent>
                 </Tooltip>
               </Label>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <Slider
                   aria-label="Hardware depreciation period, years"
                   min={1}
@@ -203,9 +203,9 @@ export function HostingSelector({ config, onChange, model }: HostingSelectorProp
                   step={1}
                   value={[config.depreciationYears]}
                   onValueChange={([v]) => onChange({ ...config, depreciationYears: v })}
-                  className="max-w-xs"
+                  className="max-w-xs min-w-[120px] flex-1"
                 />
-                <span className="text-sm tabular-nums text-muted-foreground w-16">
+                <span className="text-sm tabular-nums text-muted-foreground w-16 shrink-0 whitespace-nowrap">
                   {config.depreciationYears} yr
                 </span>
               </div>
@@ -231,7 +231,7 @@ export function HostingSelector({ config, onChange, model }: HostingSelectorProp
               </TooltipContent>
             </Tooltip>
           </Label>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <Slider
               aria-label="Ops and maintenance overhead percentage"
               min={0}
@@ -239,9 +239,9 @@ export function HostingSelector({ config, onChange, model }: HostingSelectorProp
               step={5}
               value={[Math.round(config.opsOverheadPct * 100)]}
               onValueChange={([v]) => onChange({ ...config, opsOverheadPct: v / 100 })}
-              className="max-w-xs"
+              className="max-w-xs min-w-[120px] flex-1"
             />
-            <span className="text-sm tabular-nums text-muted-foreground w-12">
+            <span className="text-sm tabular-nums text-muted-foreground w-12 shrink-0 whitespace-nowrap">
               {Math.round(config.opsOverheadPct * 100)}%
             </span>
           </div>

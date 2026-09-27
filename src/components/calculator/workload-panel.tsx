@@ -88,7 +88,7 @@ export function WorkloadPanel({ workload, onChange, showCaching }: WorkloadPanel
           {workload.docSizePresetId === "custom" && (
             <div className="space-y-1.5 pt-1">
               <Label htmlFor="custom-pages">Page count</Label>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <Slider
                   id="custom-pages"
                   aria-label="Page count"
@@ -97,9 +97,9 @@ export function WorkloadPanel({ workload, onChange, showCaching }: WorkloadPanel
                   step={1}
                   value={[workload.customPages]}
                   onValueChange={([v]) => onChange({ ...workload, customPages: v })}
-                  className="max-w-xs"
+                  className="max-w-xs min-w-[120px] flex-1"
                 />
-                <span className="text-sm tabular-nums text-muted-foreground w-32">
+                <span className="text-sm tabular-nums text-muted-foreground w-32 shrink-0">
                   {workload.customPages} pages (~{formatNumber(docTokens)} tokens)
                 </span>
               </div>
@@ -131,7 +131,7 @@ export function WorkloadPanel({ workload, onChange, showCaching }: WorkloadPanel
 
         <div className="space-y-2">
           <Label htmlFor="calls-per-doc">AI calls per document</Label>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <Slider
               id="calls-per-doc"
               aria-label="AI calls per document"
@@ -140,9 +140,9 @@ export function WorkloadPanel({ workload, onChange, showCaching }: WorkloadPanel
               step={1}
               value={[workload.callsPerDoc]}
               onValueChange={([v]) => onChange({ ...workload, callsPerDoc: v })}
-              className="max-w-xs"
+              className="max-w-xs min-w-[120px] flex-1"
             />
-            <span className="text-sm tabular-nums text-muted-foreground w-8">
+            <span className="text-sm tabular-nums text-muted-foreground w-8 shrink-0 whitespace-nowrap">
               {workload.callsPerDoc}
             </span>
           </div>

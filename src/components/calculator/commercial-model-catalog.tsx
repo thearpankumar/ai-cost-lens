@@ -60,13 +60,13 @@ export function CommercialModelCatalog({
   }, [filteredModels, workload, sort]);
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 @container">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm font-medium">
           {rows.length} model{rows.length === 1 ? "" : "s"} &middot; select one to see the full
           breakdown
         </p>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-1.5">
             <Switch id="task-filter" checked={taskFilterOn} onCheckedChange={setTaskFilterOn} />
             <Label htmlFor="task-filter" className="text-xs text-muted-foreground font-normal">
@@ -74,7 +74,7 @@ export function CommercialModelCatalog({
             </Label>
           </div>
           <Select value={sort} onValueChange={(v) => setSort(v as SortMode)}>
-            <SelectTrigger className="w-[180px]" size="sm">
+            <SelectTrigger className="w-full sm:w-[180px]" size="sm">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -86,7 +86,12 @@ export function CommercialModelCatalog({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+      {/* Column count is keyed to this grid's own rendered width (container
+          queries), not the viewport - the grid lives in a lg:col-span-2 pane
+          that's permanently ~800px wide regardless of screen size, so a
+          viewport-based `xl:` breakpoint would force 3 cramped ~260px cards
+          on every laptop/desktop width instead of reflecting real space. */}
+      <div className="grid grid-cols-1 @xl:grid-cols-2 @4xl:grid-cols-3 gap-3">
         {rows.map(({ model, cost }) => {
           const selected = model.id === selectedId;
           return (
