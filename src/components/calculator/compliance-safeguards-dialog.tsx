@@ -9,7 +9,6 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
 import {
   ShieldCheck,
   Filter,
@@ -88,7 +87,7 @@ export function ComplianceSafeguardsDialog() {
           Security &amp; compliance safeguards
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+      <DialogContent className="max-w-[calc(100%-2rem)] sm:max-w-3xl lg:max-w-6xl max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Security and compliance safeguards</DialogTitle>
           <DialogDescription>
@@ -97,25 +96,22 @@ export function ComplianceSafeguardsDialog() {
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-5">
-          {SECTIONS.map((section, i) => (
-            <div key={section.title}>
-              {i > 0 && <Separator className="mb-5" />}
-              <div className="flex items-start gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {SECTIONS.map((section) => (
+            <div key={section.title} className="rounded-lg border p-4 space-y-2">
+              <div className="flex items-center gap-2.5">
                 <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                   <section.icon className="h-4 w-4" />
                 </div>
-                <div className="space-y-1.5">
-                  <h3 className="text-sm font-semibold">{section.title}</h3>
-                  <ul className="space-y-1">
-                    {section.points.map((point) => (
-                      <li key={point} className="text-sm text-muted-foreground leading-snug">
-                        {point}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+                <h3 className="text-sm font-semibold">{section.title}</h3>
               </div>
+              <ul className="space-y-1.5">
+                {section.points.map((point) => (
+                  <li key={point} className="text-sm text-muted-foreground leading-snug">
+                    {point}
+                  </li>
+                ))}
+              </ul>
             </div>
           ))}
         </div>
