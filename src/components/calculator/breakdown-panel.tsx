@@ -44,6 +44,37 @@ function WarningBanner({ children }: { children: ReactNode }) {
   );
 }
 
+const VRAM_HEADROOM_MESSAGE =
+  "This configuration leaves little spare VRAM for request concurrency - long documents or multiple simultaneous requests may be slower than expected.";
+
+function VramHeadroomNotice({ modelName }: { modelName?: string }) {
+  return (
+    <WarningBanner>
+      {modelName && <span className="font-semibold">{modelName}: </span>}
+      {VRAM_HEADROOM_MESSAGE}
+    </WarningBanner>
+  );
+}
+
+/** Plain-English "why this many GPUs" explanation for a self-host breakdown. */
+export function describeLimitingFactor(breakdown: SelfHostCostBreakdown): string {
+  switch (breakdown.limitingFactor) {
+    case "concurrency":
+      return `sized to comfortably handle ${formatNumber(Math.ceil(breakdown.peakConcurrentUsers))} people at once`;
+    case "volume":
+      return "sized for your document volume";
+    default:
+      return "minimum footprint for this model";
+  }
+}
+
+function gpuCountLabel(breakdown: SelfHostCostBreakdown): string {
+  const gpus = `${breakdown.gpusNeeded} GPU${breakdown.gpusNeeded > 1 ? "s" : ""}`;
+  if (breakdown.gpusNeeded === breakdown.replicas) return gpus;
+  const perReplica = breakdown.gpusNeeded / breakdown.replicas;
+  return `${gpus} (${breakdown.replicas} x ${perReplica}-GPU cluster${breakdown.replicas > 1 ? "s" : ""})`;
+}
+
 export interface ContextWindowWarning {
   modelName: string;
   inputTokensPerCall: number;
@@ -308,16 +339,20 @@ export function SelfHostBreakdownPanel({
           </div>
           <Progress value={breakdown.utilizationPct} />
           <p className="text-xs text-muted-foreground">
-            {breakdown.gpusNeeded} GPU{breakdown.gpusNeeded > 1 ? "s" : ""} needed to comfortably
-            handle this volume.
+            <span className="font-medium text-foreground">{gpuCountLabel(breakdown)}</span> -{" "}
+            {describeLimitingFactor(breakdown)}. Average load during your ~
+            {formatNumber(Math.round(breakdown.activeHoursPerMonth))} active hours/month, with 20%
+            planning headroom kept free.
           </p>
         </div>
+
+        {breakdown.vramHeadroomWarning && <VramHeadroomNotice />}
 
         {lowUtilization && (
           <WarningBanner>
             <span className="font-semibold">Utilization is only {breakdown.utilizationPct.toFixed(0)}%</span>{" "}
             across your selected regions - splitting volume this many ways forces a minimum of one
-            GPU per region even at low usage. Consider fewer regions, or cloud rental with
+            full model deployment per region even at low usage. Consider fewer regions, or cloud rental with
             autoscaling, to avoid paying for idle capacity.
           </WarningBanner>
         )}
@@ -327,10 +362,19 @@ export function SelfHostBreakdownPanel({
         <div>
           <LineItem
             label={isOwned ? "Hardware (amortized)" : "GPU rental"}
+            sub={
+              isOwned
+                ? `${breakdown.gpusNeeded} GPU${breakdown.gpusNeeded > 1 ? "s" : ""}`
+                : `${breakdown.gpusNeeded} GPU${breakdown.gpusNeeded > 1 ? "s" : ""} x ~${formatNumber(Math.round(breakdown.billedHoursPerMonth))} h/month`
+            }
             value={formatUsd(breakdown.computeCostMonthly)}
           />
           {isOwned && (
-            <LineItem label="Electricity" value={formatUsd(breakdown.electricityCostMonthly)} />
+            <LineItem
+              label="Electricity"
+              sub={`~${formatNumber(Math.round(breakdown.billedHoursPerMonth))} powered hours/month`}
+              value={formatUsd(breakdown.electricityCostMonthly)}
+            />
           )}
           <LineItem label="Ops & maintenance" value={formatUsd(breakdown.overheadCostMonthly)} />
           <Separator className="my-2" />
@@ -373,6 +417,15 @@ export function RoutedSelfHostBreakdownPanel({
     low: lowModel,
   };
   const totalDocs = breakdown.tiers.reduce((sum, t) => sum + t.docsPerMonth, 0);
+  // Tier results are repeated per region; list each tight model once.
+  const vramTightModels = Array.from(
+    new Set(
+      breakdown.tiers
+        .filter((t) => t.breakdown.vramHeadroomWarning)
+        .map((t) => modelsByTier[t.tier]?.name)
+        .filter((name): name is string => !!name),
+    ),
+  );
 
   return (
     <Card className="sticky top-4">
@@ -426,6 +479,8 @@ export function RoutedSelfHostBreakdownPanel({
           </WarningBanner>
         )}
 
+        {vramTightModels.length > 0 && <VramHeadroomNotice modelName={vramTightModels.join(", ")} />}
+
         {regionalBreakdowns && <RegionalCostList rows={regionalBreakdowns} />}
 
         <Separator />
@@ -439,7 +494,7 @@ export function RoutedSelfHostBreakdownPanel({
               <LineItem
                 key={tierKey}
                 label={`${tierModel.name} (${TIER_LABELS[tierKey]})`}
-                sub={`${formatNumber(tier.docsPerMonth)} of ${formatNumber(totalDocs)} docs/mo · ${tier.breakdown.gpusNeeded} GPU${tier.breakdown.gpusNeeded > 1 ? "s" : ""}`}
+                sub={`${formatNumber(tier.docsPerMonth)} of ${formatNumber(totalDocs)} docs/mo · ${gpuCountLabel(tier.breakdown)}, ${describeLimitingFactor(tier.breakdown)}`}
                 value={formatUsd(tier.breakdown.totalMonthlyCost)}
               />
             );

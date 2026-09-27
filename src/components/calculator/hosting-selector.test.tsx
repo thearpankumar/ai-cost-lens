@@ -11,7 +11,12 @@ function Harness({ initial }: { initial: SelfHostConfig }) {
   const [config, setConfig] = useState(initial);
   return (
     <TooltipProvider>
-      <HostingSelector config={config} onChange={setConfig} model={OPEN_SOURCE_MODELS[0]} />
+      <HostingSelector
+        config={config}
+        onChange={setConfig}
+        model={OPEN_SOURCE_MODELS[0]}
+        activeHoursPerMonth={217}
+      />
       <div data-testid="gpu-instance-id">{config.gpuInstanceId}</div>
     </TooltipProvider>
   );
@@ -29,7 +34,7 @@ describe("HostingSelector - cloud switch GPU preservation (regression)", () => {
           gpuInstanceId: startInstance.id,
           useReservedPricing: false,
           ownedGpuType: "H100-80GB",
-          hoursPerDay: 24,
+          scaleDownOutsideActiveHours: false,
           depreciationYears: 3,
           opsOverheadPct: 0.25,
         }}
@@ -58,7 +63,7 @@ describe("HostingSelector - cloud switch GPU preservation (regression)", () => {
           gpuInstanceId: startInstance.id,
           useReservedPricing: false,
           ownedGpuType: "L4",
-          hoursPerDay: 24,
+          scaleDownOutsideActiveHours: false,
           depreciationYears: 3,
           opsOverheadPct: 0.25,
         }}
@@ -72,5 +77,39 @@ describe("HostingSelector - cloud switch GPU preservation (regression)", () => {
 
     expect(resultingInstance?.cloud).toBe("Azure");
     expect(resultingInstance).toBeDefined();
+  });
+});
+
+describe("HostingSelector - shut down outside active hours", () => {
+  const initial: SelfHostConfig = {
+    location: "cloud",
+    cloudProvider: "AWS",
+    gpuInstanceId: "aws-g6-xlarge",
+    useReservedPricing: true,
+    scaleDownOutsideActiveHours: false,
+    ownedGpuType: "L4",
+    depreciationYears: 3,
+    opsOverheadPct: 0.25,
+  };
+
+  it("disables (and visually unchecks) reserved pricing once scale-down is turned on", async () => {
+    const user = userEvent.setup();
+    render(<Harness initial={initial} />);
+
+    const reserved = screen.getByRole("switch", { name: /committed-use \/ reserved pricing/i });
+    expect(reserved).toBeEnabled();
+    expect(reserved).toBeChecked();
+
+    await user.click(screen.getByRole("switch", { name: /shut down outside active hours/i }));
+
+    expect(reserved).toBeDisabled();
+    expect(reserved).not.toBeChecked();
+    expect(screen.getByText(/reserved pricing assumes 24\/7 use/i)).toBeInTheDocument();
+  });
+
+  it("shows derived powered-on hours instead of a separate hours slider for owned hardware", () => {
+    render(<Harness initial={{ ...initial, location: "owned" }} />);
+    expect(screen.queryByRole("slider", { name: /hours running per day/i })).not.toBeInTheDocument();
+    expect(screen.getByText("~217 h/month")).toBeInTheDocument();
   });
 });

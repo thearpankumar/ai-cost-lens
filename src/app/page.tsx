@@ -18,7 +18,12 @@ import {
 } from "@/components/calculator/breakdown-panel";
 import { useLivePricing } from "@/lib/use-live-pricing";
 import { OPEN_SOURCE_MODELS } from "@/lib/data/opensource-models";
-import { GPU_INSTANCES, OWNED_GPU_SPECS, CLOUD_OPS_OVERHEAD_DEFAULT_PCT } from "@/lib/data/gpu-instances";
+import {
+  GPU_INSTANCES,
+  GPU_VRAM_GB,
+  OWNED_GPU_SPECS,
+  CLOUD_OPS_OVERHEAD_DEFAULT_PCT,
+} from "@/lib/data/gpu-instances";
 import { ROUTER_OPTIONS, DEFAULT_ESCALATION_RATE_PCT } from "@/lib/data/routing";
 import { REGIONS, DATA_RESIDENCY_PREMIUM_PCT } from "@/lib/data/regions";
 import {
@@ -33,14 +38,18 @@ import {
   checkContextWindowFit,
   estimateSelfHostMonthlyCost,
   getModelsCheaperThan,
+  getActiveHoursPerMonth,
   getOpenSourceModelsCheaperThan,
   scaleRoutedSelfHostBreakdown,
   scaleSelfHostBreakdown,
   splitDocsAcrossRegions,
   withDataResidencyPremium,
+  withWorkloadShare,
   type HostParams,
 } from "@/lib/calculations";
 import { COMMERCIAL_MODELS } from "@/lib/data/commercial-models";
+import { DEFAULT_CAPACITY_PROFILE } from "@/lib/data/constants";
+import { UsagePatternPanel } from "@/components/calculator/usage-pattern-panel";
 import type { ContextWindowWarning } from "@/components/calculator/breakdown-panel";
 import type { CalcMode, RegionAllocation, RegionId, RoutingConfig, WorkloadInputs } from "@/lib/types";
 
@@ -51,6 +60,8 @@ const DEFAULT_WORKLOAD: WorkloadInputs = {
   taskType: "extraction",
   callsPerDoc: 1,
   useCaching: true,
+  useBatchApi: false,
+  capacity: DEFAULT_CAPACITY_PROFILE,
 };
 
 const DEFAULT_COMMERCIAL_MODEL_ID = "anthropic/claude-sonnet-5";
@@ -90,14 +101,20 @@ const DEFAULT_SELF_HOST_ROUTING_CONFIG: RoutingConfig = {
 function defaultHostConfig(): SelfHostConfig {
   const model = OPEN_SOURCE_MODELS.find((m) => m.id === DEFAULT_OPEN_SOURCE_MODEL_ID)!;
   const awsMatch = GPU_INSTANCES.find((i) => i.cloud === "AWS" && i.gpuType === model.minGpuType);
-  const awsFallback = GPU_INSTANCES.find((i) => i.cloud === "AWS");
+  // AWS doesn't offer every GPU type (e.g. no A100-80GB) - if there's no
+  // exact match, fall back to AWS's most capable option rather than
+  // whichever happens to be first in the list, so the default view doesn't
+  // silently under-provision VRAM for the default model.
+  const awsFallback = [...GPU_INSTANCES]
+    .filter((i) => i.cloud === "AWS")
+    .sort((a, b) => GPU_VRAM_GB[b.gpuType] - GPU_VRAM_GB[a.gpuType])[0];
   return {
     location: "cloud",
     cloudProvider: "AWS",
     gpuInstanceId: (awsMatch ?? awsFallback)!.id,
     useReservedPricing: false,
+    scaleDownOutsideActiveHours: false,
     ownedGpuType: model.minGpuType,
-    hoursPerDay: 24,
     depreciationYears: 3,
     opsOverheadPct: CLOUD_OPS_OVERHEAD_DEFAULT_PCT,
   };
@@ -306,6 +323,7 @@ export default function Home() {
         kind: "cloud",
         gpuInstance: selectedGpuInstance,
         useReservedPricing: hostConfig.useReservedPricing,
+        scaleDownOutsideActiveHours: hostConfig.scaleDownOutsideActiveHours,
         opsOverheadPct: hostConfig.opsOverheadPct,
       };
     }
@@ -313,7 +331,6 @@ export default function Home() {
     return {
       kind: "owned",
       ownedGpu: ownedSpec,
-      hoursPerMonth: hostConfig.hoursPerDay * 30,
       opsOverheadPct: hostConfig.opsOverheadPct,
       depreciationYears: hostConfig.depreciationYears,
     };
@@ -323,7 +340,7 @@ export default function Home() {
     () =>
       selectedRegions.map((regionId, i) => {
         const docsPerMonth = regionDocsSplit[i];
-        const regionalWorkload = { ...workload, docsPerMonth };
+        const regionalWorkload = withWorkloadShare(workload, docsPerMonth, 1 / selectedRegions.length);
         const base = calculateSelfHostCost(regionalWorkload, selectedOpenSourceModel, hostParams);
         const multiplier = REGIONS.find((r) => r.id === regionId)?.gpuPriceMultiplier ?? 1;
         const breakdown = scaleSelfHostBreakdown(base, multiplier, docsPerMonth);
@@ -355,6 +372,7 @@ export default function Home() {
         kind: "cloud",
         gpuInstance: match ?? fallback,
         useReservedPricing: hostConfig.useReservedPricing,
+        scaleDownOutsideActiveHours: hostConfig.scaleDownOutsideActiveHours,
         opsOverheadPct: hostConfig.opsOverheadPct,
       };
     }
@@ -364,7 +382,6 @@ export default function Home() {
     return {
       kind: "owned",
       ownedGpu: ownedSpec,
-      hoursPerMonth: hostConfig.hoursPerDay * 30,
       opsOverheadPct: hostConfig.opsOverheadPct,
       depreciationYears: hostConfig.depreciationYears,
     };
@@ -374,7 +391,7 @@ export default function Home() {
     () =>
       selectedRegions.map((regionId, i) => {
         const docsPerMonth = regionDocsSplit[i];
-        const regionalWorkload = { ...workload, docsPerMonth };
+        const regionalWorkload = withWorkloadShare(workload, docsPerMonth, 1 / selectedRegions.length);
         const highTier = { model: selectedOpenSourceModel, hostParams: hostParamsForModel(selectedOpenSourceModel) };
         const lowTier = {
           model: selectedSelfHostSmallModel,
@@ -466,6 +483,10 @@ export default function Home() {
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
             <div className="space-y-6 lg:col-span-2">
               <WorkloadPanel workload={workload} onChange={setWorkload} showCaching={false} />
+              <UsagePatternPanel
+                capacity={workload.capacity}
+                onChange={(capacity) => setWorkload({ ...workload, capacity })}
+              />
               <RegionSelector selectedRegions={selectedRegions} onChange={setSelectedRegions} />
               <OpenSourceModelCatalog
                 models={OPEN_SOURCE_MODELS}
@@ -477,6 +498,7 @@ export default function Home() {
                 config={hostConfig}
                 onChange={setHostConfig}
                 model={selectedOpenSourceModel}
+                activeHoursPerMonth={getActiveHoursPerMonth(workload.capacity)}
               />
               <SelfHostRoutingPanel
                 config={selfHostRoutingConfig}
@@ -516,7 +538,7 @@ export default function Home() {
         <TabsContent value="api" className="mt-4">
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
             <div className="space-y-6 lg:col-span-2">
-              <WorkloadPanel workload={workload} onChange={setWorkload} showCaching />
+              <WorkloadPanel workload={workload} onChange={setWorkload} showCaching showBatchApi />
               <RegionSelector
                 selectedRegions={selectedRegions}
                 onChange={setSelectedRegions}

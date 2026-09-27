@@ -1,4 +1,4 @@
-import type { GpuInstance, OwnedGpuSpec } from "@/lib/types";
+import type { GpuInstance, GpuType, OwnedGpuSpec } from "@/lib/types";
 
 // Cloud GPU on-demand pricing, US regions. Verified: 2026-09-28.
 // perGpuOnDemandPerHour normalizes multi-GPU instances to a per-card rate
@@ -42,7 +42,9 @@ export const GPU_INSTANCES: GpuInstance[] = [
     ramGB: 1152,
     onDemandPerHour: 21.9576,
     perGpuOnDemandPerHour: 2.7447,
-    reservedDiscountPct: 0.55,
+    // Corrected 0.55 -> 0.37: published 1-yr committed-use discount for P4d
+    // (post June-2025 AWS GPU repricing) is ~37%, not 55%.
+    reservedDiscountPct: 0.37,
   },
   {
     id: "aws-p5-48xlarge",
@@ -52,9 +54,12 @@ export const GPU_INSTANCES: GpuInstance[] = [
     instanceName: "p5.48xlarge",
     vcpu: 192,
     ramGB: 2048,
-    onDemandPerHour: 98.32,
-    perGpuOnDemandPerHour: 12.29,
-    reservedDiscountPct: 0.4,
+    // AWS cut P5 on-demand pricing ~44% in June 2025 ($12.29 -> $6.88 per
+    // GPU-hr, instance total 8 x 6.88 = $55.04/hr); 1-yr committed-use
+    // discount corrected 0.4 -> 0.57.
+    onDemandPerHour: 55.04,
+    perGpuOnDemandPerHour: 6.88,
+    reservedDiscountPct: 0.57,
   },
   // Azure
   {
@@ -143,6 +148,15 @@ export const GPU_INSTANCES: GpuInstance[] = [
     reservedDiscountPct: 0.4,
   },
 ];
+
+// Usable memory per card, used for the VRAM headroom warning.
+export const GPU_VRAM_GB: Record<GpuType, number> = {
+  L4: 24,
+  A10G: 24,
+  "A100-40GB": 40,
+  "A100-80GB": 80,
+  "H100-80GB": 80,
+};
 
 // Approximate owned-hardware costs for the "Own Server" self-host mode.
 // Street/OEM prices vary widely by vendor and region - treat as an estimate.

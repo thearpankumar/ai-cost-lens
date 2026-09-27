@@ -8,7 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { GPU_INSTANCES, OWNED_GPU_SPECS } from "@/lib/data/gpu-instances";
 import { cn } from "@/lib/utils";
-import { formatUsd } from "@/lib/format";
+import { formatNumber, formatUsd } from "@/lib/format";
 import type { CloudProvider, GpuType, HostingLocation, OpenSourceModel } from "@/lib/types";
 import { Info } from "lucide-react";
 
@@ -17,8 +17,9 @@ export interface SelfHostConfig {
   cloudProvider: CloudProvider;
   gpuInstanceId: string;
   useReservedPricing: boolean;
+  // Cloud only: stop GPUs outside the usage pattern's active hours.
+  scaleDownOutsideActiveHours: boolean;
   ownedGpuType: GpuType;
-  hoursPerDay: number;
   depreciationYears: number;
   opsOverheadPct: number;
 }
@@ -29,9 +30,13 @@ interface HostingSelectorProps {
   config: SelfHostConfig;
   onChange: (next: SelfHostConfig) => void;
   model: OpenSourceModel;
+  // Derived from the workload's usage pattern (active hours/day x days/week).
+  activeHoursPerMonth: number;
 }
 
-export function HostingSelector({ config, onChange, model }: HostingSelectorProps) {
+export function HostingSelector({ config, onChange, model, activeHoursPerMonth }: HostingSelectorProps) {
+  const reservedDisabled = config.scaleDownOutsideActiveHours;
+  const activeHoursLabel = formatNumber(Math.round(activeHoursPerMonth));
   const cloudInstances = GPU_INSTANCES.filter((i) => i.cloud === config.cloudProvider);
   const currentGpuType = GPU_INSTANCES.find((i) => i.id === config.gpuInstanceId)?.gpuType;
 
@@ -119,16 +124,61 @@ export function HostingSelector({ config, onChange, model }: HostingSelectorProp
 
             <div className="flex items-center justify-between gap-4 rounded-md border p-3">
               <div>
-                <Label htmlFor="reserved" className="text-sm">
-                  Use committed-use / reserved pricing
+                <Label htmlFor="scale-down" className="text-sm">
+                  Shut down outside active hours
                 </Label>
                 <p className="text-xs text-muted-foreground">
-                  Approx. discount for a 1-year commitment instead of on-demand rates.
+                  {config.scaleDownOutsideActiveHours
+                    ? `Pay only for your ~${activeHoursLabel} active hours/month, plus ~30 min/day to spin up and load the model.`
+                    : "GPUs stay on 24/7 (730 h/month), even outside your active hours."}
+                </p>
+              </div>
+              <Switch
+                id="scale-down"
+                checked={config.scaleDownOutsideActiveHours}
+                onCheckedChange={(checked) => onChange({ ...config, scaleDownOutsideActiveHours: checked })}
+              />
+            </div>
+
+            <div
+              className={cn(
+                "flex items-center justify-between gap-4 rounded-md border p-3",
+                reservedDisabled && "opacity-60",
+              )}
+            >
+              <div>
+                <div className="flex items-center gap-1.5">
+                  <Label htmlFor="reserved" className="text-sm">
+                    Use committed-use / reserved pricing
+                  </Label>
+                  {reservedDisabled && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Info
+                          className="h-3.5 w-3.5 text-muted-foreground"
+                          aria-label="Why reserved pricing is unavailable"
+                        />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-64">
+                        <p>
+                          Reserved / committed-use discounts require paying for the GPUs around
+                          the clock for a year, so they can&apos;t be combined with shutting down
+                          outside active hours.
+                        </p>
+                      </TooltipContent>
+                    </Tooltip>
+                  )}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {reservedDisabled
+                    ? "Not available while shutting down outside active hours (reserved pricing assumes 24/7 use)."
+                    : "Approx. discount for a 1-year commitment instead of on-demand rates."}
                 </p>
               </div>
               <Switch
                 id="reserved"
-                checked={config.useReservedPricing}
+                disabled={reservedDisabled}
+                checked={config.useReservedPricing && !reservedDisabled}
                 onCheckedChange={(checked) => onChange({ ...config, useReservedPricing: checked })}
               />
             </div>
@@ -165,22 +215,16 @@ export function HostingSelector({ config, onChange, model }: HostingSelectorProp
               })}
             </div>
 
-            <div className="space-y-2">
-              <Label>Hours running per day</Label>
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                <Slider
-                  aria-label="Hours running per day"
-                  min={1}
-                  max={24}
-                  step={1}
-                  value={[config.hoursPerDay]}
-                  onValueChange={([v]) => onChange({ ...config, hoursPerDay: v })}
-                  className="max-w-xs min-w-[120px] flex-1"
-                />
-                <span className="text-sm tabular-nums text-muted-foreground w-24 shrink-0 whitespace-nowrap">
-                  {config.hoursPerDay}h/day
-                </span>
+            <div className="flex items-center justify-between gap-4 rounded-md border p-3">
+              <div>
+                <p className="text-sm">Powered on</p>
+                <p className="text-xs text-muted-foreground">
+                  From your usage pattern above - electricity is estimated for these active hours.
+                </p>
               </div>
+              <span className="text-sm font-medium tabular-nums whitespace-nowrap">
+                ~{activeHoursLabel} h/month
+              </span>
             </div>
 
             <div className="space-y-2">

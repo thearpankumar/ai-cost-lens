@@ -8,19 +8,33 @@ import {
   calculateRoutedApiCost,
   calculateRoutedSelfHostCost,
   calculateSelfHostCost,
+  estimateSelfHostMonthlyCost,
+  getActiveHoursPerMonth,
+  getCloudBilledHoursPerMonth,
   getDocTokens,
   getModelsCheaperThan,
   getOpenSourceModelsCheaperThan,
   getMonthlyTokenVolume,
+  hasVramHeadroomWarning,
   scaleRoutedSelfHostBreakdown,
   scaleSelfHostBreakdown,
   splitDocsAcrossRegions,
   withDataResidencyPremium,
+  withWorkloadShare,
   type HostParams,
   type SelfHostRoutingTier,
 } from "@/lib/calculations";
-import { TOKENS_PER_PAGE, SECONDS_PER_MONTH, HOURS_PER_MONTH } from "@/lib/data/constants";
+import {
+  DEFAULT_CAPACITY_PROFILE,
+  HOURS_PER_MONTH,
+  INPUT_TOKEN_COMPUTE_WEIGHT,
+  TOKENS_PER_PAGE,
+  UTILIZATION_TARGET,
+  WEEKS_PER_MONTH,
+} from "@/lib/data/constants";
 import { OWN_SERVER_DEFAULTS } from "@/lib/data/gpu-instances";
+import { COMMERCIAL_MODELS } from "@/lib/data/commercial-models";
+import { OPEN_SOURCE_MODELS } from "@/lib/data/opensource-models";
 import { ROUTER_TOKENS_PER_DECISION } from "@/lib/data/routing";
 import type {
   CommercialModel,
@@ -39,7 +53,16 @@ const baseWorkload: WorkloadInputs = {
   taskType: "extraction", // outputRatio 0.12, overhead 350, floor 80
   callsPerDoc: 1,
   useCaching: false,
+  useBatchApi: false,
+  // Default usage pattern: batch pipeline, 10h/day x 5 days/week.
+  capacity: DEFAULT_CAPACITY_PROFILE,
 };
+
+// 10h x 5 days x (365/7/12 = 4.345238 weeks/month) = 217.2619 active hours/month
+// = 782,142.86 active seconds/month.
+const DEFAULT_ACTIVE_SECONDS = 10 * 5 * (365 / 7 / 12) * 3600;
+// 24h x 7 days x 4.345238 = 730.0 hours/month = 2,628,000 seconds (the old 24/7 assumption).
+const ALWAYS_ON_CAPACITY = { ...DEFAULT_CAPACITY_PROFILE, activeHoursPerDay: 24, activeDaysPerWeek: 7 };
 
 describe("getDocTokens", () => {
   it("converts a preset page count into tokens", () => {
@@ -198,19 +221,31 @@ describe("calculateSelfHostCost - cloud rental", () => {
   it("sizes GPU count and utilization from required throughput", () => {
     const result = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, cloudParams);
 
-    const effectiveMonthlyTokens = 672_000 + 5_950_000 * 0.1; // output + weighted input
-    const expectedThroughput = effectiveMonthlyTokens / SECONDS_PER_MONTH;
+    // output + weighted input = 672,000 + 5,950,000 * 0.45 = 672,000 + 2,677,500 = 3,349,500
+    const effectiveMonthlyTokens = 672_000 + 5_950_000 * 0.45;
+    expect(effectiveMonthlyTokens).toBe(3_349_500);
+    expect(INPUT_TOKEN_COMPUTE_WEIGHT).toBe(0.45);
+    // Processed within the 10h x 5d active window, not 24/7:
+    // 3,349,500 / 782,142.86 s = 4.2825 tok/s
+    const expectedThroughput = effectiveMonthlyTokens / DEFAULT_ACTIVE_SECONDS;
+    expect(expectedThroughput).toBeCloseTo(4.2825, 4);
 
     expect(result.requiredThroughputTokPerSec).toBeCloseTo(expectedThroughput, 6);
     expect(result.gpuThroughputTokPerSec).toBe(1000); // A100-80GB multiplier is 1.0
+    expect(result.replicas).toBe(1);
     expect(result.gpusNeeded).toBe(1);
+    expect(result.limitingFactor).toBe("minimum-footprint");
+    expect(result.activeHoursPerMonth).toBeCloseTo(217.2619, 4);
+    // 4.2825 / (1 replica * 1000 tok/s) = 0.428%
     expect(result.utilizationPct).toBeCloseTo((expectedThroughput / 1000) * 100, 6);
   });
 
   it("computes on-demand compute + overhead cost with no electricity line item", () => {
     const result = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, cloudParams);
 
-    const expectedCompute = 1 * 3 * HOURS_PER_MONTH; // 1 GPU * $3/hr * 730h
+    // Scale-down is off by default, so GPUs are billed 24/7: 1 GPU * $3/hr * 730h = $2,190
+    const expectedCompute = 1 * 3 * HOURS_PER_MONTH;
+    expect(result.billedHoursPerMonth).toBe(HOURS_PER_MONTH);
     expect(result.computeCostMonthly).toBeCloseTo(expectedCompute, 5);
     expect(result.electricityCostMonthly).toBe(0);
     expect(result.overheadCostMonthly).toBeCloseTo(expectedCompute * 0.25, 5);
@@ -281,7 +316,6 @@ describe("calculateSelfHostCost - owned hardware", () => {
   const ownedParams: HostParams = {
     kind: "owned",
     ownedGpu: syntheticOwnedGpu,
-    hoursPerMonth: HOURS_PER_MONTH,
     opsOverheadPct: 0.3,
     depreciationYears: 2,
   };
@@ -291,9 +325,12 @@ describe("calculateSelfHostCost - owned hardware", () => {
 
     const hardwareTotal = 1 * 10_000 * OWN_SERVER_DEFAULTS.serverOverheadMultiplier;
     const expectedDepreciation = hardwareTotal / (2 * 12);
-    const expectedKw = (1 * 300 * OWN_SERVER_DEFAULTS.pue) / 1000;
+    const expectedKw = (1 * 300 * OWN_SERVER_DEFAULTS.pue) / 1000; // 0.42 kW
+    // Owned hardware is powered for the usage pattern's active hours:
+    // 0.42 kW * 217.2619 h * $0.14/kWh = $12.775
     const expectedElectricity =
-      expectedKw * HOURS_PER_MONTH * OWN_SERVER_DEFAULTS.electricityPricePerKwh;
+      expectedKw * (10 * 5 * WEEKS_PER_MONTH) * OWN_SERVER_DEFAULTS.electricityPricePerKwh;
+    expect(expectedElectricity).toBeCloseTo(12.775, 3);
     const expectedOverhead = (expectedDepreciation + expectedElectricity) * 0.3;
 
     expect(result.computeCostMonthly).toBeCloseTo(expectedDepreciation, 5);
@@ -778,5 +815,328 @@ describe("region aggregation", () => {
     expect(combined.totalMonthlyCost).toBeCloseTo(regionA.totalMonthlyCost + regionB.totalMonthlyCost, 6);
     expect(combined.utilizationPct).toBeGreaterThan(0);
     expect(combined.utilizationPct).toBeLessThanOrEqual(100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Capacity model: replicas, usage pattern, scale-down billing, VRAM headroom
+// ---------------------------------------------------------------------------
+
+const a100CloudParams: HostParams = {
+  kind: "cloud",
+  gpuInstance: syntheticGpuInstance, // A100-80GB, $3/GPU-hr, 50% reserved discount
+  useReservedPricing: false,
+  opsOverheadPct: 0.25,
+};
+
+describe("calculateSelfHostCost - GPU count scales in whole replicas of minGpuCount", () => {
+  // A model that needs an 8-GPU cluster just to load. Its 1000 tok/s baseline
+  // is the aggregate throughput of ONE 8-GPU replica.
+  const clusterModel: OpenSourceModel = { ...syntheticOpenSourceModel, id: "test/cluster", minGpuCount: 8 };
+
+  it("regression: bills the full 8-GPU footprint even at low volume (previously priced as 1 GPU)", () => {
+    const result = calculateSelfHostCost(baseWorkload, clusterModel, a100CloudParams);
+    expect(result.replicas).toBe(1);
+    expect(result.gpusNeeded).toBe(8);
+    expect(result.limitingFactor).toBe("minimum-footprint");
+    // 8 GPUs * $3/hr * 730h = $17,520
+    expect(result.computeCostMonthly).toBeCloseTo(8 * 3 * 730, 5);
+  });
+
+  it("adds a whole second cluster (8 more GPUs) once one replica can't keep up", () => {
+    // 200,000 docs * 3,349.5 effective tokens = 669,900,000 tokens
+    // / 782,142.86 active s = 856.5 tok/s ; one replica plans for 1000 * 0.8 = 800 tok/s
+    // -> ceil(856.5 / 800) = 2 replicas -> 2 * 8 = 16 GPUs
+    const workload = { ...baseWorkload, docsPerMonth: 200_000 };
+    const result = calculateSelfHostCost(workload, clusterModel, a100CloudParams);
+    expect(result.requiredThroughputTokPerSec).toBeCloseTo(856.5, 1);
+    expect(result.replicas).toBe(2);
+    expect(result.gpusNeeded).toBe(16);
+    expect(result.limitingFactor).toBe("volume");
+    expect(result.computeCostMonthly).toBeCloseTo(16 * 3 * 730, 5);
+    // utilization during active hours = 856.5 / (2 * 1000) = 42.8%
+    expect(result.utilizationPct).toBeCloseTo(42.83, 1);
+  });
+
+  it("keeps the 80% utilization planning target", () => {
+    expect(UTILIZATION_TARGET).toBe(0.8);
+  });
+});
+
+describe("calculateSelfHostCost - batch operating window", () => {
+  const workload = { ...baseWorkload, docsPerMonth: 200_000 };
+
+  it("needs more GPUs to process the same volume in business hours than spread over 24/7", () => {
+    // 24/7: 669,900,000 / 2,628,000 s = 254.9 tok/s -> ceil(254.9 / 800) = 1 replica
+    // 10h x 5d: 669,900,000 / 782,142.86 s = 856.5 tok/s -> ceil(856.5 / 800) = 2 replicas
+    const alwaysOn = calculateSelfHostCost(
+      { ...workload, capacity: ALWAYS_ON_CAPACITY },
+      syntheticOpenSourceModel,
+      a100CloudParams,
+    );
+    const businessHours = calculateSelfHostCost(workload, syntheticOpenSourceModel, a100CloudParams);
+
+    expect(alwaysOn.activeHoursPerMonth).toBeCloseTo(730, 6);
+    expect(alwaysOn.requiredThroughputTokPerSec).toBeCloseTo(254.9, 1);
+    expect(alwaysOn.gpusNeeded).toBe(1);
+    expect(businessHours.gpusNeeded).toBe(2);
+    expect(businessHours.totalMonthlyCost).toBeGreaterThan(alwaysOn.totalMonthlyCost);
+  });
+
+  it("computes active hours/month from hours/day x days/week x weeks/month", () => {
+    expect(getActiveHoursPerMonth(DEFAULT_CAPACITY_PROFILE)).toBeCloseTo(217.2619, 4);
+    expect(getActiveHoursPerMonth(ALWAYS_ON_CAPACITY)).toBeCloseTo(730, 6);
+  });
+});
+
+describe("calculateSelfHostCost - interactive (live users) pattern", () => {
+  const interactive = (peakConcurrentUsers: number, targetTokPerSecPerUser = 20): WorkloadInputs => ({
+    ...baseWorkload,
+    capacity: { ...DEFAULT_CAPACITY_PROFILE, pattern: "interactive", peakConcurrentUsers, targetTokPerSecPerUser },
+  });
+
+  it("sizes for peak concurrency even when monthly volume alone would fit one replica", () => {
+    // Volume: 4.28 tok/s -> 1 replica.
+    // Concurrency: one replica serves floor(1000 * 0.8 / 20) = 40 users at 20 tok/s;
+    // 100 users -> ceil(100 / 40) = 3 replicas.
+    const result = calculateSelfHostCost(interactive(100), syntheticOpenSourceModel, a100CloudParams);
+    expect(result.replicas).toBe(3);
+    expect(result.gpusNeeded).toBe(3);
+    expect(result.limitingFactor).toBe("concurrency");
+    expect(result.peakConcurrentUsers).toBe(100);
+
+    const sameVolumeAsBatch = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, a100CloudParams);
+    expect(sameVolumeAsBatch.gpusNeeded).toBe(1);
+  });
+
+  it("multiplies concurrency replicas by minGpuCount for multi-GPU models", () => {
+    const twoGpuModel = { ...syntheticOpenSourceModel, minGpuCount: 2 };
+    const result = calculateSelfHostCost(interactive(100), twoGpuModel, a100CloudParams);
+    expect(result.replicas).toBe(3);
+    expect(result.gpusNeeded).toBe(6);
+  });
+
+  it("needs more replicas for a snappier per-user speed target", () => {
+    // 40 tok/s per user -> floor(800 / 40) = 20 users per replica -> ceil(100 / 20) = 5 replicas
+    const snappy = calculateSelfHostCost(interactive(100, 40), syntheticOpenSourceModel, a100CloudParams);
+    expect(snappy.replicas).toBe(5);
+    // 8 tok/s -> floor(800 / 8) = 100 users per replica -> 1 replica
+    const reading = calculateSelfHostCost(interactive(100, 8), syntheticOpenSourceModel, a100CloudParams);
+    expect(reading.replicas).toBe(1);
+  });
+
+  it("ignores concurrency inputs in batch mode", () => {
+    const batchWithUsers: WorkloadInputs = {
+      ...baseWorkload,
+      capacity: { ...DEFAULT_CAPACITY_PROFILE, pattern: "batch", peakConcurrentUsers: 10_000 },
+    };
+    const result = calculateSelfHostCost(batchWithUsers, syntheticOpenSourceModel, a100CloudParams);
+    expect(result.replicas).toBe(1);
+    expect(result.peakConcurrentUsers).toBe(0);
+  });
+});
+
+describe("calculateSelfHostCost - shut down outside active hours (cloud)", () => {
+  const scaleDownParams: HostParams = {
+    kind: "cloud",
+    gpuInstance: syntheticGpuInstance,
+    useReservedPricing: false,
+    opsOverheadPct: 0.25,
+    scaleDownOutsideActiveHours: true,
+  };
+
+  it("bills active hours plus a 30-min/active-day spin-up buffer instead of 730h", () => {
+    // 217.2619 active h + 0.5h * 5 days * 4.345238 weeks = 217.2619 + 10.8631 = 228.125 h
+    const result = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, scaleDownParams);
+    expect(result.billedHoursPerMonth).toBeCloseTo(228.125, 3);
+    // 1 GPU * $3/hr * 228.125h = $684.375
+    expect(result.computeCostMonthly).toBeCloseTo(684.375, 3);
+  });
+
+  it("ignores reserved pricing when scaling down (reserved assumes a 24/7 commitment)", () => {
+    const withReserved = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, {
+      ...scaleDownParams,
+      useReservedPricing: true,
+    });
+    const withoutReserved = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, scaleDownParams);
+    expect(withReserved.computeCostMonthly).toBeCloseTo(withoutReserved.computeCostMonthly, 6);
+  });
+
+  it("never bills more than the full month, even for a 24/7 pattern", () => {
+    expect(getCloudBilledHoursPerMonth(ALWAYS_ON_CAPACITY, true)).toBe(HOURS_PER_MONTH);
+    expect(getCloudBilledHoursPerMonth(DEFAULT_CAPACITY_PROFILE, false)).toBe(HOURS_PER_MONTH);
+  });
+});
+
+describe("VRAM headroom warning", () => {
+  const llama70b = OPEN_SOURCE_MODELS.find((m) => m.id === "llama-3.3-70b")!;
+  const deepseekFlash = OPEN_SOURCE_MODELS.find((m) => m.id === "deepseek-v4-flash")!;
+
+  it("warns for a genuinely tight fit: a 70B model (40GB at 4-bit) on a single 24GB L4", () => {
+    // 40GB * 1.1 = 44GB > 24GB * 1
+    expect(hasVramHeadroomWarning(llama70b, "L4")).toBe(true);
+    const result = calculateSelfHostCost(baseWorkload, llama70b, {
+      ...a100CloudParams,
+      gpuInstance: { ...syntheticGpuInstance, gpuType: "L4" },
+    });
+    expect(result.vramHeadroomWarning).toBe(true);
+  });
+
+  it("does not warn when the recommended GPU has headroom", () => {
+    // 40GB * 1.1 = 44GB <= 80GB * 1
+    expect(hasVramHeadroomWarning(llama70b, "A100-80GB")).toBe(false);
+    const result = calculateSelfHostCost(baseWorkload, llama70b, a100CloudParams);
+    expect(result.vramHeadroomWarning).toBe(false);
+  });
+
+  it("regression: DeepSeek V4 Flash at the old 2x H100 sizing was tight; the corrected 4x H100 is not", () => {
+    // 160GB * 1.1 = 176GB > 2 * 80GB = 160GB, but <= 4 * 80GB = 320GB
+    expect(deepseekFlash.minGpuCount).toBe(4);
+    expect(hasVramHeadroomWarning({ ...deepseekFlash, minGpuCount: 2 }, "H100-80GB")).toBe(true);
+    expect(hasVramHeadroomWarning(deepseekFlash, "H100-80GB")).toBe(false);
+  });
+
+  it("no catalog model warns on its own recommended GPU setup", () => {
+    const tight = OPEN_SOURCE_MODELS.filter((m) => hasVramHeadroomWarning(m, m.minGpuType));
+    expect(tight.map((m) => m.id)).toEqual([]);
+  });
+});
+
+describe("Batch API pricing", () => {
+  it("halves calculateApiCost's total (input, cached input and output)", () => {
+    const standard = calculateApiCost(baseWorkload, syntheticCommercialModel);
+    const batch = calculateApiCost({ ...baseWorkload, useBatchApi: true }, syntheticCommercialModel);
+    // $18.62 -> $9.31
+    expect(batch.totalMonthlyCost).toBeCloseTo(9.31, 5);
+    expect(batch.totalMonthlyCost).toBeCloseTo(standard.totalMonthlyCost * 0.5, 6);
+    // Token counts are unchanged - only prices are discounted.
+    expect(batch.monthlyInputTokens).toBe(standard.monthlyInputTokens);
+
+    const cachedStandard = calculateApiCost({ ...baseWorkload, useCaching: true }, syntheticCommercialModel);
+    const cachedBatch = calculateApiCost(
+      { ...baseWorkload, useCaching: true, useBatchApi: true },
+      syntheticCommercialModel,
+    );
+    expect(cachedBatch.totalMonthlyCost).toBeCloseTo(cachedStandard.totalMonthlyCost * 0.5, 6);
+  });
+
+  it("halves each routed tier's model cost, but not the router's cost", () => {
+    const standard = calculateRoutedApiCost(baseWorkload, bigModel, smallModel, layaRouter, 0.25);
+    const batch = calculateRoutedApiCost({ ...baseWorkload, useBatchApi: true }, bigModel, smallModel, layaRouter, 0.25);
+    expect(batch.bigModelCost).toBeCloseTo(standard.bigModelCost * 0.5, 6); // 4.655 -> 2.3275
+    expect(batch.smallModelCost).toBeCloseTo(standard.smallModelCost * 0.5, 6);
+    expect(batch.routerCost).toBe(standard.routerCost);
+    expect(batch.baselineCost).toBeCloseTo(standard.baselineCost * 0.5, 6);
+  });
+});
+
+describe("Claude tokenizer multiplier", () => {
+  const CLAUDE_NEW_TOKENIZER_IDS = [
+    "anthropic/claude-sonnet-5",
+    "anthropic/claude-opus-5.5",
+    "anthropic/claude-fable-5.1",
+  ];
+
+  it("adds 30% input tokens for exactly the three newest-tokenizer Claude models", () => {
+    for (const model of COMMERCIAL_MODELS) {
+      const result = calculateApiCost(baseWorkload, model);
+      if (CLAUDE_NEW_TOKENIZER_IDS.includes(model.id)) {
+        // 5,950,000 * 1.3 = 7,735,000
+        expect(result.monthlyInputTokens, model.id).toBe(7_735_000);
+      } else {
+        expect(result.monthlyInputTokens, model.id).toBe(5_950_000);
+      }
+      // Output tokens are not affected.
+      expect(result.monthlyOutputTokens, model.id).toBe(672_000);
+    }
+    expect(COMMERCIAL_MODELS.filter((m) => m.tokenizerMultiplier).map((m) => m.id).sort()).toEqual(
+      [...CLAUDE_NEW_TOKENIZER_IDS].sort(),
+    );
+  });
+
+  it("prices the extra input tokens (synthetic $2/$10 model)", () => {
+    const withMultiplier = calculateApiCost(baseWorkload, { ...syntheticCommercialModel, tokenizerMultiplier: 1.3 });
+    // input: 7,735,000 * $2/M = $15.47 ; output unchanged at $6.72 -> $22.19 (vs $18.62)
+    expect(withMultiplier.inputCost).toBeCloseTo(15.47, 5);
+    expect(withMultiplier.totalMonthlyCost).toBeCloseTo(22.19, 5);
+  });
+
+  it("applies in routed API calculations too, only to the model that has it", () => {
+    const claudeLikeBig = { ...bigModel, tokenizerMultiplier: 1.3 };
+    const result = calculateRoutedApiCost(baseWorkload, claudeLikeBig, smallModel, jevRouter, 0.25);
+    // 250 calls: 1,487,500 input * 1.3 = 1,933,750 tokens * $2/M = $3.8675 ; output 168,000 * $10/M = $1.68
+    expect(result.bigModelCost).toBeCloseTo(5.5475, 5);
+    // small model has no multiplier: unchanged from the plain 2-tier case
+    expect(result.smallModelCost).toBeCloseTo(0.64785, 5);
+  });
+});
+
+describe("Routing and regions split peak concurrent users proportionally", () => {
+  const interactiveWorkload: WorkloadInputs = {
+    ...baseWorkload,
+    capacity: { ...DEFAULT_CAPACITY_PROFILE, pattern: "interactive", peakConcurrentUsers: 100 },
+  };
+
+  it("gives each routing tier its share of peak users", () => {
+    const highTier: SelfHostRoutingTier = { model: highOssModel, hostParams: highHostParams };
+    const lowTier: SelfHostRoutingTier = { model: lowOssModel, hostParams: lowHostParams };
+    const result = calculateRoutedSelfHostCost(interactiveWorkload, highTier, lowTier, laya, 0.25);
+    const high = result.tiers.find((t) => t.tier === "high")!;
+    const low = result.tiers.find((t) => t.tier === "low")!;
+
+    // High: 25 users; 1000 tok/s * 0.8 / 20 = 40 users/replica -> 1 replica
+    expect(high.breakdown.peakConcurrentUsers).toBe(25);
+    expect(high.breakdown.replicas).toBe(1);
+    // Low: 75 users; L4 model at 1800 tok/s * 0.8 / 20 = 72 users/replica -> 2 replicas
+    expect(low.breakdown.peakConcurrentUsers).toBe(75);
+    expect(low.breakdown.replicas).toBe(2);
+    expect(low.breakdown.limitingFactor).toBe("concurrency");
+  });
+
+  it("withWorkloadShare scales peak users and sets the region's docs", () => {
+    const half = withWorkloadShare(interactiveWorkload, 500, 0.5);
+    expect(half.docsPerMonth).toBe(500);
+    expect(half.capacity.peakConcurrentUsers).toBe(50);
+    expect(interactiveWorkload.capacity.peakConcurrentUsers).toBe(100); // not mutated
+  });
+
+  it("aggregates replicas, limiting factor and VRAM warnings across regions", () => {
+    const regionA = calculateSelfHostCost(
+      withWorkloadShare(interactiveWorkload, 500, 0.5),
+      syntheticOpenSourceModel,
+      a100CloudParams,
+    );
+    const regionB = calculateSelfHostCost(
+      withWorkloadShare(interactiveWorkload, 500, 0.5),
+      syntheticOpenSourceModel,
+      a100CloudParams,
+    );
+    // 50 users per region / 40 per replica -> 2 replicas each
+    expect(regionA.replicas).toBe(2);
+    const combined = aggregateSelfHostBreakdowns([
+      { regionId: "us", docsPerMonth: 500, breakdown: regionA },
+      { regionId: "eu", docsPerMonth: 500, breakdown: regionB },
+    ]);
+    expect(combined.replicas).toBe(4);
+    expect(combined.gpusNeeded).toBe(4);
+    expect(combined.limitingFactor).toBe("concurrency");
+    expect(combined.peakConcurrentUsers).toBe(100);
+    expect(combined.vramHeadroomWarning).toBe(false);
+    // scaling for a regional price multiplier preserves the new fields
+    const scaled = scaleSelfHostBreakdown(regionA, 1.3, 500);
+    expect(scaled.replicas).toBe(regionA.replicas);
+    expect(scaled.limitingFactor).toBe(regionA.limitingFactor);
+  });
+});
+
+describe("estimateSelfHostMonthlyCost uses the workload's usage pattern", () => {
+  it("costs more under an interactive pattern that needs more replicas", () => {
+    const llama70b = OPEN_SOURCE_MODELS.find((m) => m.id === "llama-3.3-70b")!;
+    const batch = estimateSelfHostMonthlyCost(baseWorkload, llama70b);
+    const interactive = estimateSelfHostMonthlyCost(
+      { ...baseWorkload, capacity: { ...DEFAULT_CAPACITY_PROFILE, pattern: "interactive", peakConcurrentUsers: 200 } },
+      llama70b,
+    );
+    expect(interactive).toBeGreaterThan(batch);
   });
 });

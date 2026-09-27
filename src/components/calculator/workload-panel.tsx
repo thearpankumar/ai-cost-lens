@@ -13,6 +13,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Info } from "lucide-react";
 import { DOC_SIZE_PRESETS, TASK_PRESETS } from "@/lib/data/constants";
 import { formatNumber } from "@/lib/format";
 import { getDocTokens } from "@/lib/calculations";
@@ -24,9 +26,10 @@ interface WorkloadPanelProps {
   workload: WorkloadInputs;
   onChange: (next: WorkloadInputs) => void;
   showCaching: boolean;
+  showBatchApi?: boolean;
 }
 
-export function WorkloadPanel({ workload, onChange, showCaching }: WorkloadPanelProps) {
+export function WorkloadPanel({ workload, onChange, showCaching, showBatchApi = false }: WorkloadPanelProps) {
   const docTokens = getDocTokens(workload);
 
   return (
@@ -167,6 +170,40 @@ export function WorkloadPanel({ workload, onChange, showCaching }: WorkloadPanel
               id="use-caching"
               checked={workload.useCaching}
               onCheckedChange={(checked) => onChange({ ...workload, useCaching: checked })}
+            />
+          </div>
+        )}
+
+        {showBatchApi && (
+          <div className="flex items-center justify-between gap-4 rounded-md border p-3">
+            <div>
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="use-batch-api" className="text-sm">
+                  Use Batch API pricing (~50% off, results within 24h)
+                </Label>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-64">
+                    <p>
+                      OpenAI, Anthropic and AWS Bedrock offer asynchronous batch endpoints at
+                      roughly half the normal per-token price, in exchange for results within
+                      24 hours instead of immediately. Not every model or provider supports a
+                      batch endpoint - check yours before relying on this.
+                    </p>
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                A good fit for overnight or back-office document pipelines that don&apos;t need
+                instant answers.
+              </p>
+            </div>
+            <Switch
+              id="use-batch-api"
+              checked={workload.useBatchApi}
+              onCheckedChange={(checked) => onChange({ ...workload, useBatchApi: checked })}
             />
           </div>
         )}

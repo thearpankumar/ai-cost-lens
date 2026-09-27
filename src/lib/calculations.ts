@@ -1,28 +1,39 @@
 import type {
   ApiCostBreakdown,
+  CapacityProfile,
   CommercialModel,
   GpuInstance,
+  GpuType,
   OpenSourceModel,
   OwnedGpuSpec,
   RouterOption,
   RoutedApiCostBreakdown,
   RoutedSelfHostCostBreakdown,
   SelfHostCostBreakdown,
+  SelfHostLimitingFactor,
   SelfHostTierResult,
   WorkloadInputs,
 } from "@/lib/types";
 import type { RegionAllocation } from "@/lib/types";
 import {
   ASSUMED_CACHEABLE_INPUT_FRACTION,
+  BATCH_API_PRICE_MULTIPLIER,
   DOC_SIZE_PRESETS,
   HOURS_PER_MONTH,
   INPUT_TOKEN_COMPUTE_WEIGHT,
-  SECONDS_PER_MONTH,
+  SCALE_DOWN_SPINUP_HOURS_PER_ACTIVE_DAY,
   TASK_PRESETS,
   TOKENS_PER_PAGE,
+  UTILIZATION_TARGET,
+  WEEKS_PER_MONTH,
 } from "@/lib/data/constants";
 import { GPU_THROUGHPUT_MULTIPLIER } from "@/lib/data/opensource-models";
-import { CLOUD_OPS_OVERHEAD_DEFAULT_PCT, GPU_INSTANCES, OWN_SERVER_DEFAULTS } from "@/lib/data/gpu-instances";
+import {
+  CLOUD_OPS_OVERHEAD_DEFAULT_PCT,
+  GPU_INSTANCES,
+  GPU_VRAM_GB,
+  OWN_SERVER_DEFAULTS,
+} from "@/lib/data/gpu-instances";
 import { ROUTER_TOKENS_PER_DECISION } from "@/lib/data/routing";
 
 export function getDocTokens(workload: WorkloadInputs): number {
@@ -58,25 +69,70 @@ export function getMonthlyTokenVolume(workload: WorkloadInputs): TokenVolume {
   };
 }
 
+/**
+ * Input-token multiplier for models whose tokenizer produces more tokens
+ * for the same text than the TOKENS_PER_PAGE baseline assumes (e.g.
+ * Anthropic's newest-generation tokenizer, ~30% more). 1 when unset.
+ */
+export function getTokenizerMultiplier(model: CommercialModel): number {
+  return model.tokenizerMultiplier ?? 1;
+}
+
+/**
+ * Prices a given number of input/output tokens on a commercial model,
+ * applying the model's tokenizer multiplier to input tokens, prompt caching
+ * (when enabled and supported) and the async Batch API discount (when
+ * enabled). Shared by the single-model and routed API calculations so both
+ * stay consistent.
+ */
+function priceApiTokens(
+  workload: WorkloadInputs,
+  model: CommercialModel,
+  rawInputTokens: number,
+  outputTokens: number,
+) {
+  const inputTokens = Math.round(rawInputTokens * getTokenizerMultiplier(model));
+  // Batch API discount applies to every token price, including cached reads.
+  const priceMultiplier = workload.useBatchApi ? BATCH_API_PRICE_MULTIPLIER : 1;
+
+  const canCache = workload.useCaching && !!model.cachedInputPricePerM;
+  const cachedInputTokens = canCache
+    ? Math.round(inputTokens * ASSUMED_CACHEABLE_INPUT_FRACTION)
+    : 0;
+  const uncachedInputTokens = inputTokens - cachedInputTokens;
+
+  const inputCost = (uncachedInputTokens / 1_000_000) * model.inputPricePerM * priceMultiplier;
+  const cachedInputCost = canCache
+    ? (cachedInputTokens / 1_000_000) * (model.cachedInputPricePerM as number) * priceMultiplier
+    : 0;
+  const outputCost = (outputTokens / 1_000_000) * model.outputPricePerM * priceMultiplier;
+
+  return {
+    inputTokens,
+    cachedInputTokens,
+    uncachedInputTokens,
+    inputCost,
+    cachedInputCost,
+    outputCost,
+    totalCost: inputCost + cachedInputCost + outputCost,
+  };
+}
+
 export function calculateApiCost(
   workload: WorkloadInputs,
   model: CommercialModel,
 ): ApiCostBreakdown {
-  const { monthlyInputTokens, monthlyOutputTokens } = getMonthlyTokenVolume(workload);
-
-  const canCache = workload.useCaching && !!model.cachedInputPricePerM;
-  const cachedInputTokens = canCache
-    ? Math.round(monthlyInputTokens * ASSUMED_CACHEABLE_INPUT_FRACTION)
-    : 0;
-  const uncachedInputTokens = monthlyInputTokens - cachedInputTokens;
-
-  const inputCost = (uncachedInputTokens / 1_000_000) * model.inputPricePerM;
-  const cachedInputCost = canCache
-    ? (cachedInputTokens / 1_000_000) * (model.cachedInputPricePerM as number)
-    : 0;
-  const outputCost = (monthlyOutputTokens / 1_000_000) * model.outputPricePerM;
-
-  const totalMonthlyCost = inputCost + cachedInputCost + outputCost;
+  const volume = getMonthlyTokenVolume(workload);
+  const monthlyOutputTokens = volume.monthlyOutputTokens;
+  const {
+    inputTokens: monthlyInputTokens,
+    cachedInputTokens,
+    uncachedInputTokens,
+    inputCost,
+    cachedInputCost,
+    outputCost,
+    totalCost: totalMonthlyCost,
+  } = priceApiTokens(workload, model, volume.monthlyInputTokens, monthlyOutputTokens);
 
   return {
     modelId: model.id,
@@ -98,17 +154,66 @@ export interface CloudHostParams {
   gpuInstance: GpuInstance;
   useReservedPricing: boolean;
   opsOverheadPct: number;
+  // When true, GPUs are only billed for the workload's active hours (plus a
+  // daily spin-up buffer) instead of 24/7. Reserved pricing is ignored in
+  // this mode, since committed-use discounts assume a 24/7 commitment.
+  scaleDownOutsideActiveHours?: boolean;
 }
 
 export interface OwnedHostParams {
   kind: "owned";
   ownedGpu: OwnedGpuSpec;
-  hoursPerMonth: number;
   opsOverheadPct: number;
   depreciationYears: number;
 }
 
 export type HostParams = CloudHostParams | OwnedHostParams;
+
+/** Hours per month the workload is actively running (activeHoursPerDay x activeDaysPerWeek x weeks/month). */
+export function getActiveHoursPerMonth(capacity: CapacityProfile): number {
+  return capacity.activeHoursPerDay * capacity.activeDaysPerWeek * WEEKS_PER_MONTH;
+}
+
+/**
+ * Billed GPU-hours per month for cloud rental. Always-on (default) bills the
+ * full month; scale-down bills active hours plus a 30-min/active-day
+ * spin-up/model-load buffer, capped at the full month.
+ */
+export function getCloudBilledHoursPerMonth(capacity: CapacityProfile, scaleDown: boolean): number {
+  if (!scaleDown) return HOURS_PER_MONTH;
+  const spinUpHours =
+    SCALE_DOWN_SPINUP_HOURS_PER_ACTIVE_DAY * capacity.activeDaysPerWeek * WEEKS_PER_MONTH;
+  return Math.min(HOURS_PER_MONTH, getActiveHoursPerMonth(capacity) + spinUpHours);
+}
+
+/**
+ * Whether the model's realistic (4-bit) weights, plus a 10% margin, would
+ * leave little spare memory on one replica of the selected GPU type - i.e.
+ * very little room for KV cache (long documents / concurrent requests).
+ */
+export function hasVramHeadroomWarning(model: OpenSourceModel, gpuType: GpuType): boolean {
+  return model.vramInt4GB * 1.1 > GPU_VRAM_GB[gpuType] * model.minGpuCount;
+}
+
+/**
+ * Returns a copy of the workload representing a proportional share of it
+ * (a smart-routing tier, or one compliance region): its own document count,
+ * and the same share of peak concurrent users.
+ */
+export function withWorkloadShare(
+  workload: WorkloadInputs,
+  docsPerMonth: number,
+  share: number,
+): WorkloadInputs {
+  return {
+    ...workload,
+    docsPerMonth,
+    capacity: {
+      ...workload.capacity,
+      peakConcurrentUsers: workload.capacity.peakConcurrentUsers * share,
+    },
+  };
+}
 
 export function calculateSelfHostCost(
   workload: WorkloadInputs,
@@ -116,35 +221,68 @@ export function calculateSelfHostCost(
   hostParams: HostParams,
 ): SelfHostCostBreakdown {
   const { monthlyInputTokens, monthlyOutputTokens } = getMonthlyTokenVolume(workload);
+  const { capacity } = workload;
+  const isInteractive = capacity.pattern === "interactive";
 
+  // Monthly volume must be processed within the active window (not smeared
+  // evenly over all 730 hours of the month).
+  const activeHoursPerMonth = getActiveHoursPerMonth(capacity);
   const effectiveMonthlyTokens =
     monthlyOutputTokens + monthlyInputTokens * INPUT_TOKEN_COMPUTE_WEIGHT;
-  const requiredThroughputTokPerSec = effectiveMonthlyTokens / SECONDS_PER_MONTH;
+  const requiredThroughputTokPerSec = effectiveMonthlyTokens / (activeHoursPerMonth * 3600);
 
   const gpuType = hostParams.kind === "cloud" ? hostParams.gpuInstance.gpuType : hostParams.ownedGpu.gpuType;
   // throughputTokPerSecOnBaseline is measured on the model's OWN recommended
-  // GPU (model.minGpuType), not always A100-80GB - normalize relative to that
-  // baseline before applying the selected GPU's multiplier, otherwise models
-  // recommended on non-A100 hardware get double- or under-scaled.
+  // GPU setup (model.minGpuCount x model.minGpuType, i.e. one replica), not
+  // always A100-80GB - normalize relative to that baseline before applying
+  // the selected GPU's multiplier, otherwise models recommended on non-A100
+  // hardware get double- or under-scaled. The result is the aggregate
+  // throughput of ONE replica.
   const selectedMultiplier = GPU_THROUGHPUT_MULTIPLIER[gpuType] ?? 1;
   const baselineMultiplier = GPU_THROUGHPUT_MULTIPLIER[model.minGpuType] ?? 1;
   const gpuThroughputTokPerSec =
     model.throughputTokPerSecOnBaseline * (selectedMultiplier / baselineMultiplier);
+  const plannedReplicaThroughput = gpuThroughputTokPerSec * UTILIZATION_TARGET;
 
-  const gpusNeeded = Math.max(1, Math.ceil(requiredThroughputTokPerSec / gpuThroughputTokPerSec));
+  // Capacity scales in whole replicas (model.minGpuCount GPUs each) - you
+  // can't add half a cluster to a model that needs 8 GPUs just to load.
+  const replicasVolume = Math.ceil(requiredThroughputTokPerSec / plannedReplicaThroughput);
+  const peakConcurrentUsers = isInteractive ? capacity.peakConcurrentUsers : 0;
+  const replicasConcurrency = isInteractive
+    ? Math.ceil(
+        peakConcurrentUsers /
+          Math.max(1, Math.floor(plannedReplicaThroughput / capacity.targetTokPerSecPerUser)),
+      )
+    : 0;
+  const replicas = Math.max(1, replicasVolume, replicasConcurrency);
+  const gpusNeeded = replicas * model.minGpuCount;
+
+  const limitingFactor: SelfHostLimitingFactor =
+    replicas === 1
+      ? "minimum-footprint"
+      : replicasConcurrency > replicasVolume
+        ? "concurrency"
+        : "volume";
+
   const utilizationPct = Math.min(
     100,
-    (requiredThroughputTokPerSec / (gpusNeeded * gpuThroughputTokPerSec)) * 100,
+    (requiredThroughputTokPerSec / (replicas * gpuThroughputTokPerSec)) * 100,
   );
 
   let computeCostMonthly = 0;
   let electricityCostMonthly = 0;
+  let billedHoursPerMonth: number;
 
   if (hostParams.kind === "cloud") {
-    const rate = hostParams.useReservedPricing
+    const scaleDown = !!hostParams.scaleDownOutsideActiveHours;
+    // Reserved/committed-use pricing assumes 24/7 usage, so it can't be
+    // combined with shutting GPUs down outside active hours.
+    const useReserved = hostParams.useReservedPricing && !scaleDown;
+    const rate = useReserved
       ? hostParams.gpuInstance.perGpuOnDemandPerHour * (1 - hostParams.gpuInstance.reservedDiscountPct)
       : hostParams.gpuInstance.perGpuOnDemandPerHour;
-    computeCostMonthly = gpusNeeded * rate * HOURS_PER_MONTH;
+    billedHoursPerMonth = getCloudBilledHoursPerMonth(capacity, scaleDown);
+    computeCostMonthly = gpusNeeded * rate * billedHoursPerMonth;
     // Electricity is already bundled into cloud on-demand/reserved pricing.
     electricityCostMonthly = 0;
   } else {
@@ -153,8 +291,10 @@ export function calculateSelfHostCost(
     const monthlyDepreciation = hardwareCostTotal / (hostParams.depreciationYears * 12);
     computeCostMonthly = monthlyDepreciation;
 
+    // Owned hardware is powered for the workload's active hours.
+    billedHoursPerMonth = activeHoursPerMonth;
     const kw = (gpusNeeded * hostParams.ownedGpu.tdpWatts * OWN_SERVER_DEFAULTS.pue) / 1000;
-    electricityCostMonthly = kw * hostParams.hoursPerMonth * OWN_SERVER_DEFAULTS.electricityPricePerKwh;
+    electricityCostMonthly = kw * billedHoursPerMonth * OWN_SERVER_DEFAULTS.electricityPricePerKwh;
   }
 
   const overheadCostMonthly =
@@ -166,7 +306,14 @@ export function calculateSelfHostCost(
     modelId: model.id,
     requiredThroughputTokPerSec,
     gpuThroughputTokPerSec,
+    replicas,
     gpusNeeded,
+    limitingFactor,
+    servingPattern: capacity.pattern,
+    peakConcurrentUsers,
+    activeHoursPerMonth,
+    billedHoursPerMonth,
+    vramHeadroomWarning: hasVramHeadroomWarning(model, gpuType),
     utilizationPct,
     computeCostMonthly,
     electricityCostMonthly,
@@ -202,24 +349,8 @@ export function calculateRoutedApiCost(
   const mediumCalls = mediumModel ? Math.round(totalCalls * clampedMediumRatePct) : 0;
   const routedCalls = Math.max(0, totalCalls - escalatedCalls - mediumCalls);
 
-  const costForCalls = (calls: number, model: CommercialModel) => {
-    const inputTokens = calls * inputTokensPerCall;
-    const outputTokens = calls * outputTokensPerCall;
-
-    const canCache = workload.useCaching && !!model.cachedInputPricePerM;
-    const cachedInputTokens = canCache
-      ? Math.round(inputTokens * ASSUMED_CACHEABLE_INPUT_FRACTION)
-      : 0;
-    const uncachedInputTokens = inputTokens - cachedInputTokens;
-
-    const inputCost = (uncachedInputTokens / 1_000_000) * model.inputPricePerM;
-    const cachedInputCost = canCache
-      ? (cachedInputTokens / 1_000_000) * (model.cachedInputPricePerM as number)
-      : 0;
-    const outputCost = (outputTokens / 1_000_000) * model.outputPricePerM;
-
-    return inputCost + cachedInputCost + outputCost;
-  };
+  const costForCalls = (calls: number, model: CommercialModel) =>
+    priceApiTokens(workload, model, calls * inputTokensPerCall, calls * outputTokensPerCall).totalCost;
 
   const bigModelCost = costForCalls(escalatedCalls, bigModel);
   const mediumModelCost = mediumModel ? costForCalls(mediumCalls, mediumModel) : 0;
@@ -358,6 +489,9 @@ export function calculateRoutedSelfHostCost(
     : 0;
   const mediumDocs = mediumTier ? Math.round(totalDocs * clampedMediumRatePct) : 0;
   const lowDocs = Math.max(0, totalDocs - highDocs - mediumDocs);
+  // Each tier also serves the same proportional share of peak concurrent
+  // users (simple proportional split, same as document volume).
+  const lowSharePct = Math.max(0, 1 - escalationRatePct - clampedMediumRatePct);
 
   const tiers: SelfHostTierResult[] = [];
 
@@ -365,7 +499,11 @@ export function calculateRoutedSelfHostCost(
     tier: "high",
     modelId: highTier.model.id,
     docsPerMonth: highDocs,
-    breakdown: calculateSelfHostCost({ ...workload, docsPerMonth: highDocs }, highTier.model, highTier.hostParams),
+    breakdown: calculateSelfHostCost(
+      withWorkloadShare(workload, highDocs, escalationRatePct),
+      highTier.model,
+      highTier.hostParams,
+    ),
   });
 
   if (mediumTier) {
@@ -374,7 +512,7 @@ export function calculateRoutedSelfHostCost(
       modelId: mediumTier.model.id,
       docsPerMonth: mediumDocs,
       breakdown: calculateSelfHostCost(
-        { ...workload, docsPerMonth: mediumDocs },
+        withWorkloadShare(workload, mediumDocs, clampedMediumRatePct),
         mediumTier.model,
         mediumTier.hostParams,
       ),
@@ -385,7 +523,11 @@ export function calculateRoutedSelfHostCost(
     tier: "low",
     modelId: lowTier.model.id,
     docsPerMonth: lowDocs,
-    breakdown: calculateSelfHostCost({ ...workload, docsPerMonth: lowDocs }, lowTier.model, lowTier.hostParams),
+    breakdown: calculateSelfHostCost(
+      withWorkloadShare(workload, lowDocs, lowSharePct),
+      lowTier.model,
+      lowTier.hostParams,
+    ),
   });
 
   const totalCalls = totalDocs * workload.callsPerDoc;
@@ -524,6 +666,17 @@ export function scaleSelfHostBreakdown(
   };
 }
 
+/**
+ * When several independently-sized deployments (e.g. regions) are combined,
+ * report the most demand-driven reason any of them needed its replicas:
+ * concurrency over volume over the bare minimum footprint.
+ */
+function combineLimitingFactors(factors: SelfHostLimitingFactor[]): SelfHostLimitingFactor {
+  if (factors.includes("concurrency")) return "concurrency";
+  if (factors.includes("volume")) return "volume";
+  return "minimum-footprint";
+}
+
 function totalDocsOf(allocations: RegionAllocation<unknown>[]): number {
   return allocations.reduce((sum, a) => sum + a.docsPerMonth, 0);
 }
@@ -595,16 +748,25 @@ export function aggregateSelfHostBreakdowns(
   const overheadCostMonthly = sum((b) => b.overheadCostMonthly);
   const totalMonthlyCost = computeCostMonthly + electricityCostMonthly + overheadCostMonthly;
   const requiredThroughputTokPerSec = sum((b) => b.requiredThroughputTokPerSec);
+  // gpuThroughputTokPerSec is per replica, so total capacity is replicas x that.
   const totalCapacityTokPerSec = allocations.reduce(
-    (acc, a) => acc + a.breakdown.gpusNeeded * a.breakdown.gpuThroughputTokPerSec,
+    (acc, a) => acc + a.breakdown.replicas * a.breakdown.gpuThroughputTokPerSec,
     0,
   );
+  const first = allocations[0]?.breakdown;
 
   return {
-    modelId: allocations[0]?.breakdown.modelId ?? "",
+    modelId: first?.modelId ?? "",
     requiredThroughputTokPerSec,
-    gpuThroughputTokPerSec: allocations[0]?.breakdown.gpuThroughputTokPerSec ?? 0,
+    gpuThroughputTokPerSec: first?.gpuThroughputTokPerSec ?? 0,
+    replicas: sum((b) => b.replicas),
     gpusNeeded: sum((b) => b.gpusNeeded),
+    limitingFactor: combineLimitingFactors(allocations.map((a) => a.breakdown.limitingFactor)),
+    servingPattern: first?.servingPattern ?? "batch",
+    peakConcurrentUsers: sum((b) => b.peakConcurrentUsers),
+    activeHoursPerMonth: first?.activeHoursPerMonth ?? 0,
+    billedHoursPerMonth: first?.billedHoursPerMonth ?? 0,
+    vramHeadroomWarning: allocations.some((a) => a.breakdown.vramHeadroomWarning),
     utilizationPct:
       totalCapacityTokPerSec > 0
         ? Math.min(100, (requiredThroughputTokPerSec / totalCapacityTokPerSec) * 100)

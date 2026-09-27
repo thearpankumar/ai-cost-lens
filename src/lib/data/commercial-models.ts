@@ -255,6 +255,8 @@ export const COMMERCIAL_MODELS: CommercialModel[] = [
     tier: "flagship",
     goodFor: ["extraction", "summarization", "qa", "rewrite"],
     blurb: "Anthropic's balanced flagship - the default choice for contract and document review.",
+    // Anthropic: newest-generation tokenizer yields ~30% more tokens for the same text.
+    tokenizerMultiplier: 1.3,
   },
   {
     id: "cohere/command-a",
@@ -338,6 +340,8 @@ export const COMMERCIAL_MODELS: CommercialModel[] = [
     tier: "frontier",
     goodFor: ["summarization", "qa", "rewrite", "extraction"],
     blurb: "Anthropic's frontier reasoning model - best for the highest-stakes, most complex documents.",
+    // Anthropic: newest-generation tokenizer yields ~30% more tokens for the same text.
+    tokenizerMultiplier: 1.3,
   },
   {
     id: "anthropic/claude-fable-5.1",
@@ -352,6 +356,8 @@ export const COMMERCIAL_MODELS: CommercialModel[] = [
     tier: "frontier",
     goodFor: ["summarization", "qa", "rewrite"],
     blurb: "Anthropic's most capable model - reserved for the hardest, highest-value work.",
+    // Anthropic: newest-generation tokenizer yields ~30% more tokens for the same text.
+    tokenizerMultiplier: 1.3,
   },
 ];
 

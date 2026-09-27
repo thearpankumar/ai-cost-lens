@@ -26,6 +26,9 @@ export interface CommercialModel {
   tier: ModelTier;
   goodFor: string[]; // task tags this model suits well
   blurb: string; // one-line, plain-English description for business users
+  // Tokens this model's tokenizer produces relative to the ~700 tokens/page
+  // baseline in TOKENS_PER_PAGE. Treated as 1 when absent.
+  tokenizerMultiplier?: number;
 }
 
 export type OpenSourceTier = "efficient" | "balanced" | "frontier" | "enterprise-cluster";
@@ -98,6 +101,21 @@ export interface DocSizePreset {
 export type CalcMode = "api" | "self-host";
 export type HostingLocation = "cloud" | "owned";
 
+// How the self-hosted deployment is used over time.
+// - "batch": a pipeline that works through the monthly document volume
+//   within an operating window (e.g. business hours).
+// - "interactive": live users (e.g. an internal assistant) where peak
+//   concurrent demand, not average monthly volume, sets the capacity needed.
+export type ServingPattern = "batch" | "interactive";
+
+export interface CapacityProfile {
+  pattern: ServingPattern;
+  activeHoursPerDay: number; // 1-24
+  activeDaysPerWeek: number; // 1-7
+  peakConcurrentUsers: number; // interactive only
+  targetTokPerSecPerUser: number; // interactive only (8 reading speed / 20 comfortable / 40 snappy)
+}
+
 export interface WorkloadInputs {
   docsPerMonth: number;
   docSizePresetId: string;
@@ -105,6 +123,9 @@ export interface WorkloadInputs {
   taskType: TaskType;
   callsPerDoc: number;
   useCaching: boolean;
+  // Async Batch API pricing (~50% off, results within 24h) for commercial APIs.
+  useBatchApi: boolean;
+  capacity: CapacityProfile;
 }
 
 export interface ApiCostBreakdown {
@@ -121,12 +142,22 @@ export interface ApiCostBreakdown {
   annualCost: number;
 }
 
+// Which bound produced the final replica count.
+export type SelfHostLimitingFactor = "minimum-footprint" | "volume" | "concurrency";
+
 export interface SelfHostCostBreakdown {
   modelId: string;
-  requiredThroughputTokPerSec: number;
-  gpuThroughputTokPerSec: number;
-  gpusNeeded: number;
-  utilizationPct: number;
+  requiredThroughputTokPerSec: number; // during active hours
+  gpuThroughputTokPerSec: number; // aggregate throughput of ONE replica (model.minGpuCount GPUs)
+  replicas: number; // independent copies of the model being served
+  gpusNeeded: number; // replicas * model.minGpuCount
+  limitingFactor: SelfHostLimitingFactor;
+  servingPattern: ServingPattern;
+  peakConcurrentUsers: number; // concurrency this deployment was sized for (0 for batch)
+  activeHoursPerMonth: number;
+  billedHoursPerMonth: number; // hours of GPU time paid for (cloud) / powered (owned)
+  vramHeadroomWarning: boolean;
+  utilizationPct: number; // average load during active hours
   computeCostMonthly: number; // GPU rental or amortized hardware
   electricityCostMonthly: number; // 0 for cloud rental
   overheadCostMonthly: number; // ops/maintenance

@@ -66,7 +66,7 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     paramsB: 14,
     vramFp16GB: 28,
     vramInt4GB: 9,
-    recommendedGpuLabel: "1x L40S 48GB",
+    recommendedGpuLabel: "1x A10G 24GB (4-bit)",
     minGpuType: "A10G",
     minGpuCount: 1,
     intelligenceScore: 46,
@@ -84,11 +84,12 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     activeParamsB: 13,
     vramFp16GB: 94,
     vramInt4GB: 28,
-    recommendedGpuLabel: "1x A100 80GB",
+    recommendedGpuLabel: "1x A100 80GB (4-bit; 94GB FP16 does not fit)",
     minGpuType: "A100-80GB",
     minGpuCount: 1,
     intelligenceScore: 50,
-    throughputTokPerSecOnBaseline: 2400,
+    // Corrected 2400 -> 1200: 4-bit single-A100 serving, per vLLM benchmarks.
+    throughputTokPerSecOnBaseline: 1200,
     tier: "balanced",
     license: "Apache 2.0",
     goodFor: ["summarization", "qa"],
@@ -156,7 +157,9 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     minGpuType: "A100-80GB",
     minGpuCount: 1,
     intelligenceScore: 64,
-    throughputTokPerSecOnBaseline: 1148,
+    // Corrected 1148 -> 600: the 1148 figure came from an ambiguous multi-GPU
+    // source; ~600 tok/s per A100 at int4 follows NVIDIA NIM per-GPU scaling.
+    throughputTokPerSecOnBaseline: 600,
     tier: "balanced",
     license: "Llama 3.3 Community License",
     goodFor: ["summarization", "qa", "rewrite", "extraction"],
@@ -173,7 +176,9 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     minGpuType: "H100-80GB",
     minGpuCount: 1,
     intelligenceScore: 68,
-    throughputTokPerSecOnBaseline: 3311,
+    // Corrected 3311 -> 1600 (same multi-GPU-source issue as Llama 3.3 70B;
+    // 1600 tok/s per H100 at 4-bit per NIM-derived per-GPU scaling).
+    throughputTokPerSecOnBaseline: 1600,
     tier: "balanced",
     license: "Qwen License (commercial use permitted)",
     goodFor: ["extraction", "summarization", "qa", "rewrite"],
@@ -225,7 +230,8 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     minGpuType: "H100-80GB",
     minGpuCount: 1,
     intelligenceScore: 74,
-    throughputTokPerSecOnBaseline: 4200,
+    // Corrected 4200 -> 2500 per single-H100 int4/fp8 vLLM benchmarks.
+    throughputTokPerSecOnBaseline: 2500,
     tier: "frontier",
     license: "Llama 4 Community License",
     goodFor: ["summarization", "qa", "rewrite", "extraction"],
@@ -239,9 +245,10 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     activeParamsB: 13,
     vramFp16GB: 568,
     vramInt4GB: 160,
-    recommendedGpuLabel: "2x H100 80GB",
+    recommendedGpuLabel: "4x H100 80GB (int4)",
     minGpuType: "H100-80GB",
-    minGpuCount: 2,
+    // Corrected 2 -> 4: ~160GB int4 weights leave no KV-cache headroom on 2x80GB.
+    minGpuCount: 4,
     intelligenceScore: 78,
     throughputTokPerSecOnBaseline: 4500,
     tier: "frontier",
@@ -384,7 +391,9 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     minGpuType: "H100-80GB",
     minGpuCount: 1,
     intelligenceScore: 60,
-    throughputTokPerSecOnBaseline: 1100,
+    // Corrected 1100 -> 2500: previous figure was well below published
+    // single-H100 vLLM benchmarks for this small-active-param MoE.
+    throughputTokPerSecOnBaseline: 2500,
     tier: "balanced",
     license: "Apache 2.0",
     goodFor: ["extraction", "summarization", "qa", "rewrite"],
@@ -398,15 +407,17 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     activeParamsB: 12,
     vramFp16GB: 276,
     vramInt4GB: 60,
-    recommendedGpuLabel: "1x H100 80GB (NVFP4)",
+    recommendedGpuLabel: "2x H100 80GB (fp8)",
     minGpuType: "H100-80GB",
-    minGpuCount: 1,
+    // Corrected 1 -> 2: NVFP4 is Blackwell-only; on Hopper (H100) the standard
+    // config is FP8 across 2x H100 (vLLM recipe / NVIDIA deployment guides).
+    minGpuCount: 2,
     intelligenceScore: 63,
     throughputTokPerSecOnBaseline: 700,
     tier: "balanced",
     license: "NVIDIA Open Model License",
     goodFor: ["summarization", "qa", "extraction"],
-    blurb: "NVIDIA's mid-size Nemotron - strong reasoning that still fits one H100.",
+    blurb: "NVIDIA's mid-size Nemotron - strong reasoning on a small 2-GPU node.",
   },
   {
     id: "mistral-large-3-open",
@@ -416,9 +427,11 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     activeParamsB: 41,
     vramFp16GB: 1552,
     vramInt4GB: 388,
-    recommendedGpuLabel: "5x H100 80GB (cluster)",
+    recommendedGpuLabel: "8x H100 80GB (cluster)",
     minGpuType: "H100-80GB",
-    minGpuCount: 5,
+    // Corrected 5 -> 8: 5-way tensor parallelism is not a valid split for this
+    // architecture; round up to the next valid cluster size.
+    minGpuCount: 8,
     intelligenceScore: 79,
     throughputTokPerSecOnBaseline: 2200,
     tier: "enterprise-cluster",
@@ -434,9 +447,10 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     activeParamsB: 55,
     vramFp16GB: 1265,
     vramInt4GB: 316,
-    recommendedGpuLabel: "4-8x H100 80GB (cluster)",
+    recommendedGpuLabel: "8x H100 80GB (cluster)",
     minGpuType: "H100-80GB",
-    minGpuCount: 4,
+    // Corrected 4 -> 8: ~316GB int4 weights plus 1M-context KV cache need a full 8-GPU node.
+    minGpuCount: 8,
     intelligenceScore: 82,
     throughputTokPerSecOnBaseline: 300,
     tier: "enterprise-cluster",
@@ -452,9 +466,11 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
     activeParamsB: 49,
     vramFp16GB: 3200,
     vramInt4GB: 800,
-    recommendedGpuLabel: "8x H100/H200 (node)",
+    recommendedGpuLabel: "16x H100 80GB (2 nodes) or 8x H200",
     minGpuType: "H100-80GB",
-    minGpuCount: 8,
+    // Corrected 8 -> 16: ~800GB int4 weights exceed an 8x H100 node (640GB);
+    // on H100-80GB it needs two nodes (or a single 8x H200 141GB node).
+    minGpuCount: 16,
     intelligenceScore: 86,
     throughputTokPerSecOnBaseline: 2600,
     tier: "enterprise-cluster",
@@ -466,8 +482,10 @@ export const OPEN_SOURCE_MODELS: OpenSourceModel[] = [
 
 // Relative GPU throughput multipliers used to re-scale a model's baseline
 // throughput figure when the user selects a different GPU tier than the
-// recommended one. Anchored to A100-80GB = 1.0 (matches published
-// vLLM benchmarks: A100 ~1,148 tok/s vs H100 ~3,311 tok/s for a 70B model).
+// recommended one. Anchored to A100-80GB = 1.0. The H100 ratio (~2.9x) comes
+// from like-for-like published vLLM benchmarks of the same 70B model on
+// A100 vs H100 (the absolute figures from that source are multi-GPU and are
+// no longer used as per-model catalog throughput - only the ratio is).
 export const GPU_THROUGHPUT_MULTIPLIER: Record<string, number> = {
   L4: 0.3,
   A10G: 0.35,
