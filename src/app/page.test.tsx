@@ -65,18 +65,28 @@ describe("Home (calculator page)", () => {
     });
   });
 
-  it("switches to the self-hosted tab and shows a GPU-based breakdown", async () => {
+  it("shows the self-hosted GPU breakdown by default, without needing a click", async () => {
+    renderHome();
+
+    await waitFor(() => {
+      expect(screen.getByText(/server capacity used/i)).toBeInTheDocument();
+    });
+    const selfHostTab = screen.getByRole("tab", { name: /self-hosted GPU server/i });
+    expect(selfHostTab).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("switches to the pay-per-use API tab and shows a token-based breakdown", async () => {
     const user = userEvent.setup();
     renderHome();
 
     await waitFor(() => {
-      expect(screen.getByText("per month")).toBeInTheDocument();
+      expect(screen.getByText(/server capacity used/i)).toBeInTheDocument();
     });
 
-    await user.click(screen.getByRole("tab", { name: /self-hosted GPU server/i }));
+    await user.click(screen.getByRole("tab", { name: /pay-per-use API/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/server capacity used/i)).toBeInTheDocument();
+      expect(screen.getByText("Input tokens")).toBeInTheDocument();
     });
   });
 
@@ -99,5 +109,24 @@ describe("Home (calculator page)", () => {
     expect(screen.getAllByText("United States", { exact: false }).length).toBeGreaterThanOrEqual(2);
     // 1000 docs split evenly across 2 regions -> "500 docs/mo" shown for each
     expect(screen.getAllByText(/500 docs\/mo/).length).toBe(2);
+  });
+
+  it("opens the security and compliance safeguards dialog with its content", async () => {
+    const user = userEvent.setup();
+    renderHome();
+
+    await waitFor(() => {
+      expect(screen.getByText(/server capacity used/i)).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: /security & compliance safeguards/i }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: /security and compliance safeguards/i }),
+      ).toBeInTheDocument();
+    });
+    expect(screen.getByText(/model integrity and supply chain/i)).toBeInTheDocument();
+    expect(screen.getByText(/data residency/i)).toBeInTheDocument();
   });
 });

@@ -2,6 +2,7 @@
 
 import { Badge } from "@/components/ui/badge";
 import { CircleDot, Sparkles } from "lucide-react";
+import { ComplianceSafeguardsDialog } from "@/components/calculator/compliance-safeguards-dialog";
 
 export function CalculatorHeader({
   pricingSource,
@@ -26,21 +27,24 @@ export function CalculatorHeader({
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">AI Cost Calculator</h1>
             <p className="text-muted-foreground mt-1 max-w-2xl">
               Estimate the monthly cost of using AI to process your documents and spreadsheets -
-              whether through a provider&apos;s API or on your own GPU server.
+              whether on your own GPU server or through a provider&apos;s API.
             </p>
           </div>
         </div>
-        <Badge variant="outline" className="gap-1.5 text-xs">
-          <CircleDot
-            className={
-              "h-2.5 w-2.5 " +
-              (pricingSource === "live"
-                ? "text-emerald-500 fill-emerald-500"
-                : "text-amber-500 fill-amber-500")
-            }
-          />
-          {pricingSource === "live" ? "Live pricing" : "Reference pricing"} &middot; {dateLabel}
-        </Badge>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="outline" className="gap-1.5 text-xs">
+            <CircleDot
+              className={
+                "h-2.5 w-2.5 " +
+                (pricingSource === "live"
+                  ? "text-emerald-500 fill-emerald-500"
+                  : "text-amber-500 fill-amber-500")
+              }
+            />
+            {pricingSource === "live" ? "Live pricing" : "Reference pricing"} &middot; {dateLabel}
+          </Badge>
+          <ComplianceSafeguardsDialog />
+        </div>
       </div>
 
       {pricingSource === "fallback" && (

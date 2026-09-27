@@ -84,7 +84,7 @@ function defaultHostConfig(): SelfHostConfig {
 export default function Home() {
   const { models: commercialModels, source, lastUpdated } = useLivePricing();
 
-  const [mode, setMode] = useState<CalcMode>("api");
+  const [mode, setMode] = useState<CalcMode>("self-host");
   const [workload, setWorkload] = useState<WorkloadInputs>(DEFAULT_WORKLOAD);
   const [selectedCommercialId, setSelectedCommercialId] = useState(DEFAULT_COMMERCIAL_MODEL_ID);
   const [selectedOpenSourceId, setSelectedOpenSourceId] = useState(DEFAULT_OPEN_SOURCE_MODEL_ID);
@@ -306,9 +306,42 @@ export default function Home() {
 
       <Tabs value={mode} onValueChange={(v) => setMode(v as CalcMode)}>
         <TabsList>
-          <TabsTrigger value="api">Pay-per-use API</TabsTrigger>
           <TabsTrigger value="self-host">Self-hosted GPU server</TabsTrigger>
+          <TabsTrigger value="api">Pay-per-use API</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="self-host" className="mt-4">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+            <div className="space-y-6 lg:col-span-2">
+              <WorkloadPanel workload={workload} onChange={setWorkload} showCaching={false} />
+              <RegionSelector selectedRegions={selectedRegions} onChange={setSelectedRegions} />
+              <OpenSourceModelCatalog
+                models={OPEN_SOURCE_MODELS}
+                workload={workload}
+                selectedId={selectedOpenSourceModel.id}
+                onSelect={setSelectedOpenSourceId}
+              />
+              <HostingSelector
+                config={hostConfig}
+                onChange={setHostConfig}
+                model={selectedOpenSourceModel}
+              />
+            </div>
+            <div className="lg:col-span-1">
+              <SelfHostBreakdownPanel
+                model={selectedOpenSourceModel}
+                breakdown={selfHostBreakdown}
+                isOwned={hostConfig.location === "owned"}
+                locationLabel={
+                  hostConfig.location === "cloud"
+                    ? `${hostConfig.cloudProvider} (${selectedGpuInstance.gpuType})`
+                    : `your own ${hostConfig.ownedGpuType} server`
+                }
+                regionalBreakdowns={regionalSelfHostRows}
+              />
+            </div>
+          </div>
+        </TabsContent>
 
         <TabsContent value="api" className="mt-4">
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -355,39 +388,6 @@ export default function Home() {
                   contextWarning={apiContextWarning}
                 />
               )}
-            </div>
-          </div>
-        </TabsContent>
-
-        <TabsContent value="self-host" className="mt-4">
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-            <div className="space-y-6 lg:col-span-2">
-              <WorkloadPanel workload={workload} onChange={setWorkload} showCaching={false} />
-              <RegionSelector selectedRegions={selectedRegions} onChange={setSelectedRegions} />
-              <OpenSourceModelCatalog
-                models={OPEN_SOURCE_MODELS}
-                workload={workload}
-                selectedId={selectedOpenSourceModel.id}
-                onSelect={setSelectedOpenSourceId}
-              />
-              <HostingSelector
-                config={hostConfig}
-                onChange={setHostConfig}
-                model={selectedOpenSourceModel}
-              />
-            </div>
-            <div className="lg:col-span-1">
-              <SelfHostBreakdownPanel
-                model={selectedOpenSourceModel}
-                breakdown={selfHostBreakdown}
-                isOwned={hostConfig.location === "owned"}
-                locationLabel={
-                  hostConfig.location === "cloud"
-                    ? `${hostConfig.cloudProvider} (${selectedGpuInstance.gpuType})`
-                    : `your own ${hostConfig.ownedGpuType} server`
-                }
-                regionalBreakdowns={regionalSelfHostRows}
-              />
             </div>
           </div>
         </TabsContent>
