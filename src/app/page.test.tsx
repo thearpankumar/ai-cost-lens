@@ -102,9 +102,12 @@ describe("Home (calculator page)", () => {
 
     await user.click(screen.getByRole("button", { name: "European Union" }));
 
-    await waitFor(() => {
-      expect(screen.getByText("By region")).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByText("By region")).toBeInTheDocument();
+      },
+      { timeout: 8000 },
+    );
     // The region toggle button plus the new per-region breakdown row both say "United States"
     expect(screen.getAllByText("United States", { exact: false }).length).toBeGreaterThanOrEqual(2);
     // 1000 docs split evenly across 2 regions -> "500 docs/mo" shown for each

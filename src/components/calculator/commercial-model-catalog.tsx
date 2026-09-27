@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/select";
 import { IntelligenceMeter, PriceTierBadge, SpeedBadge } from "@/components/calculator/rating-widgets";
 import { calculateApiCost } from "@/lib/calculations";
+import { providerLogos } from "@/lib/data/logos";
 import { formatUsd } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { CommercialModel, WorkloadInputs } from "@/lib/types";
@@ -108,9 +109,19 @@ export function CommercialModelCatalog({
             >
               <div className="flex items-start justify-between gap-2">
                 <div>
-                  <Badge variant="secondary" className="mb-1 text-[10px] font-normal">
-                    {model.provider}
-                  </Badge>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <img
+                      src={providerLogos[model.provider]}
+                      alt=""
+                      aria-hidden="true"
+                      width={16}
+                      height={16}
+                      className="h-4 w-4 object-contain shrink-0"
+                    />
+                    <Badge variant="secondary" className="text-[10px] font-normal">
+                      {model.provider}
+                    </Badge>
+                  </div>
                   <h3 className="text-sm font-semibold leading-tight">{model.name}</h3>
                 </div>
                 <PriceTierBadge tier={model.tier} />

@@ -576,6 +576,10 @@ export default function Home() {
           by provider. Not every model is available in every compliance region on enterprise routes
           (e.g. AWS Bedrock, Azure OpenAI, Vertex AI); confirm availability with your provider.
         </p>
+        <p>
+          Provider and model-family logos are trademarks of their respective owners, shown solely
+          to identify which company a listed model belongs to.
+        </p>
       </footer>
     </div>
   );

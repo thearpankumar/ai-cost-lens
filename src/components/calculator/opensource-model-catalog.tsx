@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/select";
 import { IntelligenceMeter, PriceTierBadge } from "@/components/calculator/rating-widgets";
 import { estimateSelfHostMonthlyCost } from "@/lib/calculations";
+import { familyLogos } from "@/lib/data/logos";
 import { formatUsd } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { OpenSourceModel, WorkloadInputs } from "@/lib/types";
@@ -106,9 +107,21 @@ export function OpenSourceModelCatalog({
             >
               <div className="flex items-start justify-between gap-2">
                 <div>
-                  <Badge variant="secondary" className="mb-1 text-[10px] font-normal">
-                    {model.family}
-                  </Badge>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    {familyLogos[model.family] && (
+                      <img
+                        src={familyLogos[model.family]}
+                        alt=""
+                        aria-hidden="true"
+                        width={16}
+                        height={16}
+                        className="h-4 w-4 object-contain shrink-0"
+                      />
+                    )}
+                    <Badge variant="secondary" className="text-[10px] font-normal">
+                      {model.family}
+                    </Badge>
+                  </div>
                   <h3 className="text-sm font-semibold leading-tight">{model.name}</h3>
                 </div>
                 <PriceTierBadge tier={model.tier} />
