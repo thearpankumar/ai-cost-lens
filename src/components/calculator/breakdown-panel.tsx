@@ -11,6 +11,7 @@ import type {
   CommercialModel,
   OpenSourceModel,
   RoutedApiCostBreakdown,
+  RoutedSelfHostCostBreakdown,
   SelfHostCostBreakdown,
 } from "@/lib/types";
 import { AlertTriangle, TrendingDown } from "lucide-react";
@@ -339,6 +340,119 @@ export function SelfHostBreakdownPanel({
         <p className="text-xs text-muted-foreground pt-2 border-t">
           Estimate based on public cloud list pricing and typical hardware/ops assumptions.
           Actual cost depends on region, negotiated discounts and real-world utilization.
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
+const TIER_LABELS: Record<"high" | "medium" | "low", string> = {
+  high: "High",
+  medium: "Medium",
+  low: "Low",
+};
+
+export function RoutedSelfHostBreakdownPanel({
+  highModel,
+  mediumModel,
+  lowModel,
+  isOwned,
+  breakdown,
+  regionalBreakdowns,
+}: {
+  highModel: OpenSourceModel;
+  mediumModel?: OpenSourceModel | null;
+  lowModel: OpenSourceModel;
+  isOwned: boolean;
+  breakdown: RoutedSelfHostCostBreakdown;
+  regionalBreakdowns?: RegionalCostRow[];
+}) {
+  const modelsByTier: Record<"high" | "medium" | "low", OpenSourceModel | null | undefined> = {
+    high: highModel,
+    medium: mediumModel,
+    low: lowModel,
+  };
+  const totalDocs = breakdown.tiers.reduce((sum, t) => sum + t.docsPerMonth, 0);
+
+  return (
+    <Card className="sticky top-4">
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <CardTitle>Cost breakdown</CardTitle>
+          <Badge variant="secondary">Smart routing</Badge>
+        </div>
+        <CardDescription>
+          Laya routing across {lowModel.name}
+          {mediumModel ? `, ${mediumModel.name}` : ""} and {highModel.name}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div>
+          <p className="text-3xl font-bold tabular-nums">{formatUsd(breakdown.totalMonthlyCost)}</p>
+          <p className="text-sm text-muted-foreground">per month</p>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <div className="rounded-md bg-muted/60 p-3">
+            <p className="text-xs text-muted-foreground">Per document</p>
+            <p className="text-lg font-semibold tabular-nums">
+              {formatUsd(breakdown.costPerDocument, { decimals: 4 })}
+            </p>
+          </div>
+          <div className="rounded-md bg-muted/60 p-3">
+            <p className="text-xs text-muted-foreground">Per year</p>
+            <p className="text-lg font-semibold tabular-nums">{formatUsd(breakdown.annualCost)}</p>
+          </div>
+        </div>
+
+        {breakdown.savingsAmount > 0 ? (
+          <div className="flex items-start gap-2 rounded-md border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/40">
+            <TrendingDown className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400 mt-0.5" />
+            <p className="text-sm text-emerald-800 dark:text-emerald-300">
+              <span className="font-semibold">
+                Save {formatUsd(breakdown.savingsAmount)}/mo ({formatPercent(breakdown.savingsPct)})
+              </span>{" "}
+              versus always running {highModel.name} alone ({formatUsd(breakdown.baselineCost)}/mo).
+            </p>
+          </div>
+        ) : (
+          <WarningBanner>
+            <span className="font-semibold">
+              This routing setup costs {formatUsd(Math.abs(breakdown.savingsAmount))}/mo more
+            </span>{" "}
+            than always running {highModel.name} alone ({formatUsd(breakdown.baselineCost)}/mo).
+            At this volume each tier&apos;s own minimum GPU outweighs the savings - try a higher
+            escalation rate, fewer tiers, or revisit once volume grows.
+          </WarningBanner>
+        )}
+
+        {regionalBreakdowns && <RegionalCostList rows={regionalBreakdowns} />}
+
+        <Separator />
+
+        <div className="space-y-1">
+          {(["high", "medium", "low"] as const).map((tierKey) => {
+            const tier = breakdown.tiers.find((t) => t.tier === tierKey);
+            const tierModel = modelsByTier[tierKey];
+            if (!tier || !tierModel) return null;
+            return (
+              <LineItem
+                key={tierKey}
+                label={`${tierModel.name} (${TIER_LABELS[tierKey]})`}
+                sub={`${formatNumber(tier.docsPerMonth)} of ${formatNumber(totalDocs)} docs/mo · ${tier.breakdown.gpusNeeded} GPU${tier.breakdown.gpusNeeded > 1 ? "s" : ""}`}
+                value={formatUsd(tier.breakdown.totalMonthlyCost)}
+              />
+            );
+          })}
+          <LineItem label="Router (Laya)" value={formatUsd(breakdown.routerCost)} />
+          <Separator className="my-2" />
+          <LineItem label="Total" value={formatUsd(breakdown.totalMonthlyCost)} />
+        </div>
+
+        <p className="text-xs text-muted-foreground pt-2 border-t">
+          Each tier is priced as {isOwned ? "amortized owned hardware" : "its own GPU rental"} sized
+          to its share of volume. Escalation rate is a planning assumption - your actual
+          complex-vs-simple split will vary by workload.
         </p>
       </CardContent>
     </Card>

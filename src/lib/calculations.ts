@@ -6,7 +6,9 @@ import type {
   OwnedGpuSpec,
   RouterOption,
   RoutedApiCostBreakdown,
+  RoutedSelfHostCostBreakdown,
   SelfHostCostBreakdown,
+  SelfHostTierResult,
   WorkloadInputs,
 } from "@/lib/types";
 import type { RegionAllocation } from "@/lib/types";
@@ -309,6 +311,164 @@ export function getModelsCheaperThan(
   return models.filter(
     (m) => m.id !== referenceModel.id && calculateApiCost(workload, m).totalMonthlyCost < referenceCost,
   );
+}
+
+/**
+ * Same structural guardrail as getModelsCheaperThan, but for self-hosted
+ * open-source models: only a model that is genuinely cheaper to self-host
+ * (on its own recommended GPU) than the reference model is offered as a
+ * cheaper routing tier.
+ */
+export function getOpenSourceModelsCheaperThan(
+  workload: WorkloadInputs,
+  models: OpenSourceModel[],
+  referenceModel: OpenSourceModel,
+): OpenSourceModel[] {
+  const referenceCost = estimateSelfHostMonthlyCost(workload, referenceModel);
+  return models.filter(
+    (m) => m.id !== referenceModel.id && estimateSelfHostMonthlyCost(workload, m) < referenceCost,
+  );
+}
+
+export interface SelfHostRoutingTier {
+  model: OpenSourceModel;
+  hostParams: HostParams;
+}
+
+/**
+ * Self-hosted counterpart to calculateRoutedApiCost: a Laya-style self-hosted
+ * router pre-classifies each request and sends a configurable share of
+ * volume to a High-tier model/GPU setup, an optional Medium tier, and routes
+ * the rest to a cheaper Low-tier model/GPU setup - reducing the number of
+ * expensive GPUs you need to provision for the bulk of your traffic.
+ */
+export function calculateRoutedSelfHostCost(
+  workload: WorkloadInputs,
+  highTier: SelfHostRoutingTier,
+  lowTier: SelfHostRoutingTier,
+  router: RouterOption,
+  escalationRatePct: number,
+  mediumTier?: SelfHostRoutingTier | null,
+  mediumRatePct = 0,
+): RoutedSelfHostCostBreakdown {
+  const totalDocs = workload.docsPerMonth;
+  const highDocs = Math.round(totalDocs * escalationRatePct);
+  const clampedMediumRatePct = mediumTier
+    ? Math.max(0, Math.min(mediumRatePct, 1 - escalationRatePct))
+    : 0;
+  const mediumDocs = mediumTier ? Math.round(totalDocs * clampedMediumRatePct) : 0;
+  const lowDocs = Math.max(0, totalDocs - highDocs - mediumDocs);
+
+  const tiers: SelfHostTierResult[] = [];
+
+  tiers.push({
+    tier: "high",
+    modelId: highTier.model.id,
+    docsPerMonth: highDocs,
+    breakdown: calculateSelfHostCost({ ...workload, docsPerMonth: highDocs }, highTier.model, highTier.hostParams),
+  });
+
+  if (mediumTier) {
+    tiers.push({
+      tier: "medium",
+      modelId: mediumTier.model.id,
+      docsPerMonth: mediumDocs,
+      breakdown: calculateSelfHostCost(
+        { ...workload, docsPerMonth: mediumDocs },
+        mediumTier.model,
+        mediumTier.hostParams,
+      ),
+    });
+  }
+
+  tiers.push({
+    tier: "low",
+    modelId: lowTier.model.id,
+    docsPerMonth: lowDocs,
+    breakdown: calculateSelfHostCost({ ...workload, docsPerMonth: lowDocs }, lowTier.model, lowTier.hostParams),
+  });
+
+  const totalCalls = totalDocs * workload.callsPerDoc;
+  const routerInputTokens = router.id === "none" ? 0 : totalCalls * ROUTER_TOKENS_PER_DECISION;
+  const routerCost =
+    router.id === "none"
+      ? 0
+      : (routerInputTokens / 1_000_000) * router.costPerMInputTokens + (router.selfHostMonthlyCost ?? 0);
+
+  const tiersCost = tiers.reduce((sum, t) => sum + t.breakdown.totalMonthlyCost, 0);
+  const totalMonthlyCost = tiersCost + routerCost;
+
+  const baselineCost = calculateSelfHostCost(workload, highTier.model, highTier.hostParams).totalMonthlyCost;
+  const savingsAmount = baselineCost - totalMonthlyCost;
+  const savingsPct = baselineCost > 0 ? (savingsAmount / baselineCost) * 100 : 0;
+
+  return {
+    tiers,
+    routerCost,
+    totalMonthlyCost,
+    costPerDocument: totalDocs > 0 ? totalMonthlyCost / totalDocs : 0,
+    annualCost: totalMonthlyCost * 12,
+    baselineCost,
+    savingsAmount,
+    savingsPct,
+    totalGpusNeeded: tiers.reduce((sum, t) => sum + t.breakdown.gpusNeeded, 0),
+  };
+}
+
+/**
+ * Scales a per-region routed self-host breakdown by that region's GPU price
+ * multiplier (each tier's compute/electricity/overhead scales; the router's
+ * flat infra fee is charged per region as-is, matching how compliance
+ * deployments provision independent infrastructure per region).
+ */
+export function scaleRoutedSelfHostBreakdown(
+  breakdown: RoutedSelfHostCostBreakdown,
+  multiplier: number,
+  regionalDocsPerMonth: number,
+): RoutedSelfHostCostBreakdown {
+  const tiers = breakdown.tiers.map((t) => ({
+    ...t,
+    breakdown: scaleSelfHostBreakdown(t.breakdown, multiplier, t.docsPerMonth),
+  }));
+  const tiersCost = tiers.reduce((sum, t) => sum + t.breakdown.totalMonthlyCost, 0);
+  const totalMonthlyCost = tiersCost + breakdown.routerCost;
+  const baselineCost = breakdown.baselineCost * multiplier;
+  const savingsAmount = baselineCost - totalMonthlyCost;
+
+  return {
+    tiers,
+    routerCost: breakdown.routerCost,
+    totalMonthlyCost,
+    costPerDocument: regionalDocsPerMonth > 0 ? totalMonthlyCost / regionalDocsPerMonth : 0,
+    annualCost: totalMonthlyCost * 12,
+    baselineCost,
+    savingsAmount,
+    savingsPct: baselineCost > 0 ? (savingsAmount / baselineCost) * 100 : 0,
+    totalGpusNeeded: tiers.reduce((sum, t) => sum + t.breakdown.gpusNeeded, 0),
+  };
+}
+
+/** Combines per-region routed self-host breakdowns into one internally-consistent total. */
+export function aggregateRoutedSelfHostBreakdowns(
+  allocations: RegionAllocation<RoutedSelfHostCostBreakdown>[],
+): RoutedSelfHostCostBreakdown {
+  const totalDocs = totalDocsOf(allocations);
+  const totalMonthlyCost = allocations.reduce((sum, a) => sum + a.breakdown.totalMonthlyCost, 0);
+  const routerCost = allocations.reduce((sum, a) => sum + a.breakdown.routerCost, 0);
+  const baselineCost = allocations.reduce((sum, a) => sum + a.breakdown.baselineCost, 0);
+  const savingsAmount = baselineCost - totalMonthlyCost;
+
+  return {
+    tiers: allocations.flatMap((a) => a.breakdown.tiers),
+    routerCost,
+    totalMonthlyCost,
+    costPerDocument: totalDocs > 0 ? totalMonthlyCost / totalDocs : 0,
+    annualCost: totalMonthlyCost * 12,
+    baselineCost,
+    savingsAmount,
+    savingsPct: baselineCost > 0 ? (savingsAmount / baselineCost) * 100 : 0,
+    totalGpusNeeded: allocations.reduce((sum, a) => sum + a.breakdown.totalGpusNeeded, 0),
+  };
 }
 
 /**

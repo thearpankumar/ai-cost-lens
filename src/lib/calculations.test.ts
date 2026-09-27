@@ -2,17 +2,22 @@ import { describe, expect, it } from "vitest";
 import {
   aggregateApiBreakdowns,
   aggregateRoutedApiBreakdowns,
+  aggregateRoutedSelfHostBreakdowns,
   aggregateSelfHostBreakdowns,
   calculateApiCost,
   calculateRoutedApiCost,
+  calculateRoutedSelfHostCost,
   calculateSelfHostCost,
   getDocTokens,
   getModelsCheaperThan,
+  getOpenSourceModelsCheaperThan,
   getMonthlyTokenVolume,
+  scaleRoutedSelfHostBreakdown,
   scaleSelfHostBreakdown,
   splitDocsAcrossRegions,
   withDataResidencyPremium,
   type HostParams,
+  type SelfHostRoutingTier,
 } from "@/lib/calculations";
 import { TOKENS_PER_PAGE, SECONDS_PER_MONTH, HOURS_PER_MONTH } from "@/lib/data/constants";
 import { OWN_SERVER_DEFAULTS } from "@/lib/data/gpu-instances";
@@ -536,6 +541,188 @@ describe("scaleSelfHostBreakdown", () => {
   it("leaves the breakdown unchanged at a 1.0 multiplier", () => {
     const scaled = scaleSelfHostBreakdown(base, 1.0, baseWorkload.docsPerMonth);
     expect(scaled.totalMonthlyCost).toBeCloseTo(base.totalMonthlyCost, 6);
+  });
+});
+
+describe("getOpenSourceModelsCheaperThan", () => {
+  it("returns only open-source models genuinely cheaper to self-host than the reference model", () => {
+    const cheapModel: OpenSourceModel = { ...syntheticOpenSourceModel, id: "test/oss-cheap", minGpuType: "L4" };
+    const pricierModel: OpenSourceModel = {
+      ...syntheticOpenSourceModel,
+      id: "test/oss-pricier",
+      minGpuType: "H100-80GB",
+      minGpuCount: 4,
+    };
+    const result = getOpenSourceModelsCheaperThan(
+      baseWorkload,
+      [syntheticOpenSourceModel, cheapModel, pricierModel],
+      syntheticOpenSourceModel,
+    );
+    const ids = result.map((m) => m.id);
+    expect(ids).toContain(cheapModel.id);
+    expect(ids).not.toContain(pricierModel.id);
+    expect(ids).not.toContain(syntheticOpenSourceModel.id);
+  });
+});
+
+const highOssModel: OpenSourceModel = { ...syntheticOpenSourceModel, id: "test/oss-high" };
+const lowOssModel: OpenSourceModel = {
+  ...syntheticOpenSourceModel,
+  id: "test/oss-low",
+  minGpuType: "L4",
+  throughputTokPerSecOnBaseline: 1800,
+};
+const mediumOssModel: OpenSourceModel = {
+  ...syntheticOpenSourceModel,
+  id: "test/oss-medium",
+  minGpuType: "A100-40GB",
+  throughputTokPerSecOnBaseline: 1400,
+};
+
+const highHostParams: HostParams = {
+  kind: "cloud",
+  gpuInstance: syntheticGpuInstance, // A100-80GB, $3/hr
+  useReservedPricing: false,
+  opsOverheadPct: 0.25,
+};
+const lowHostParams: HostParams = {
+  kind: "cloud",
+  gpuInstance: { ...syntheticGpuInstance, id: "test-l4", gpuType: "L4", perGpuOnDemandPerHour: 0.8 },
+  useReservedPricing: false,
+  opsOverheadPct: 0.25,
+};
+const mediumHostParams: HostParams = {
+  kind: "cloud",
+  gpuInstance: { ...syntheticGpuInstance, id: "test-a100-40", gpuType: "A100-40GB", perGpuOnDemandPerHour: 2 },
+  useReservedPricing: false,
+  opsOverheadPct: 0.25,
+};
+
+const laya: RouterOption = {
+  id: "laya",
+  name: "Laya",
+  vendor: "Open source",
+  isSelfHosted: true,
+  costPerMInputTokens: 0,
+  selfHostMonthlyCost: 60,
+  blurb: "test",
+};
+const noRouterOption: RouterOption = {
+  id: "none",
+  name: "No routing",
+  vendor: "-",
+  isSelfHosted: false,
+  costPerMInputTokens: 0,
+  blurb: "test",
+};
+
+describe("calculateRoutedSelfHostCost", () => {
+  const highTier: SelfHostRoutingTier = { model: highOssModel, hostParams: highHostParams };
+  const lowTier: SelfHostRoutingTier = { model: lowOssModel, hostParams: lowHostParams };
+  const mediumTier: SelfHostRoutingTier = { model: mediumOssModel, hostParams: mediumHostParams };
+
+  it("splits document volume across tiers according to their rates", () => {
+    const result = calculateRoutedSelfHostCost(baseWorkload, highTier, lowTier, laya, 0.25);
+    expect(result.tiers).toHaveLength(2); // high + low, no medium
+    const high = result.tiers.find((t) => t.tier === "high")!;
+    const low = result.tiers.find((t) => t.tier === "low")!;
+    expect(high.docsPerMonth).toBe(250);
+    expect(low.docsPerMonth).toBe(750);
+  });
+
+  it("adds a three-way split when a medium tier is provided", () => {
+    const result = calculateRoutedSelfHostCost(baseWorkload, highTier, lowTier, laya, 0.25, mediumTier, 0.2);
+    expect(result.tiers).toHaveLength(3);
+    const high = result.tiers.find((t) => t.tier === "high")!;
+    const medium = result.tiers.find((t) => t.tier === "medium")!;
+    const low = result.tiers.find((t) => t.tier === "low")!;
+    expect(high.docsPerMonth).toBe(250);
+    expect(medium.docsPerMonth).toBe(200);
+    expect(low.docsPerMonth).toBe(550);
+    expect(high.docsPerMonth + medium.docsPerMonth + low.docsPerMonth).toBe(1000);
+  });
+
+  it("includes the router's flat self-host cost", () => {
+    const result = calculateRoutedSelfHostCost(baseWorkload, highTier, lowTier, laya, 0.25);
+    expect(result.routerCost).toBe(60);
+    expect(result.baselineCost).toBeGreaterThan(0);
+  });
+
+  it("reduces total cost vs. baseline once volume is high enough that the baseline would need multiple high-tier GPUs", () => {
+    // At high volume, always using the High-tier model/GPU needs 2 GPUs; routing
+    // most traffic to a single cheap Low-tier GPU and reserving just 1 High-tier
+    // GPU for the escalated share costs less than 2 High-tier GPUs.
+    const highVolumeWorkload = { ...baseWorkload, docsPerMonth: 3_000_000 };
+    const result = calculateRoutedSelfHostCost(highVolumeWorkload, highTier, lowTier, laya, 0.25);
+    const baseline = calculateSelfHostCost(highVolumeWorkload, highOssModel, highHostParams);
+
+    expect(baseline.gpusNeeded).toBeGreaterThan(1);
+    expect(result.totalMonthlyCost).toBeLessThan(result.baselineCost);
+    expect(result.savingsAmount).toBeGreaterThan(0);
+  });
+
+  it("regression: at low volume, splitting into separate tiers can cost MORE than a single deployment, because each tier pays its own minimum-1-GPU floor", () => {
+    // This is a real, expected characteristic of self-hosted routing (unlike
+    // API routing): a single low-volume deployment may already be far under
+    // one GPU's capacity, so splitting it into two separately-hosted tiers
+    // means paying for two GPU floors instead of one.
+    const result = calculateRoutedSelfHostCost(baseWorkload, highTier, lowTier, laya, 0.25);
+    const baseline = calculateSelfHostCost(baseWorkload, highOssModel, highHostParams);
+
+    expect(baseline.gpusNeeded).toBe(1);
+    expect(result.tiers.every((t) => t.breakdown.gpusNeeded === 1)).toBe(true);
+    expect(result.totalMonthlyCost).toBeGreaterThan(result.baselineCost);
+    expect(result.savingsAmount).toBeLessThan(0);
+  });
+
+  it("charges no router cost when routing is off", () => {
+    const result = calculateRoutedSelfHostCost(baseWorkload, highTier, lowTier, noRouterOption, 0.25);
+    expect(result.routerCost).toBe(0);
+  });
+
+  it("clamps the medium rate so the low tier never goes negative", () => {
+    const result = calculateRoutedSelfHostCost(baseWorkload, highTier, lowTier, laya, 0.75, mediumTier, 0.5);
+    const low = result.tiers.find((t) => t.tier === "low")!;
+    expect(low.docsPerMonth).toBeGreaterThanOrEqual(0);
+  });
+
+  it("sums GPUs needed across all active tiers", () => {
+    const result = calculateRoutedSelfHostCost(baseWorkload, highTier, lowTier, laya, 0.25);
+    const high = result.tiers.find((t) => t.tier === "high")!;
+    const low = result.tiers.find((t) => t.tier === "low")!;
+    expect(result.totalGpusNeeded).toBe(high.breakdown.gpusNeeded + low.breakdown.gpusNeeded);
+  });
+});
+
+describe("scaleRoutedSelfHostBreakdown and aggregateRoutedSelfHostBreakdowns", () => {
+  const highTier: SelfHostRoutingTier = { model: highOssModel, hostParams: highHostParams };
+  const lowTier: SelfHostRoutingTier = { model: lowOssModel, hostParams: lowHostParams };
+
+  it("scales tier costs and baseline by the region multiplier, but not the router fee", () => {
+    const base = calculateRoutedSelfHostCost(baseWorkload, highTier, lowTier, laya, 0.25);
+    const scaled = scaleRoutedSelfHostBreakdown(base, 1.3, baseWorkload.docsPerMonth);
+
+    const baseTiersCost = base.tiers.reduce((s, t) => s + t.breakdown.totalMonthlyCost, 0);
+    const scaledTiersCost = scaled.tiers.reduce((s, t) => s + t.breakdown.totalMonthlyCost, 0);
+    expect(scaledTiersCost).toBeCloseTo(baseTiersCost * 1.3, 5);
+    expect(scaled.routerCost).toBe(base.routerCost);
+    expect(scaled.totalMonthlyCost).toBeCloseTo(scaledTiersCost + base.routerCost, 5);
+    expect(scaled.baselineCost).toBeCloseTo(base.baselineCost * 1.3, 5);
+  });
+
+  it("aggregates multiple regions into one internally-consistent total", () => {
+    const regionA = calculateRoutedSelfHostCost({ ...baseWorkload, docsPerMonth: 400 }, highTier, lowTier, laya, 0.25);
+    const regionB = calculateRoutedSelfHostCost({ ...baseWorkload, docsPerMonth: 600 }, highTier, lowTier, laya, 0.25);
+    const combined = aggregateRoutedSelfHostBreakdowns([
+      { regionId: "us", docsPerMonth: 400, breakdown: regionA },
+      { regionId: "eu", docsPerMonth: 600, breakdown: regionB },
+    ]);
+
+    expect(combined.totalMonthlyCost).toBeCloseTo(regionA.totalMonthlyCost + regionB.totalMonthlyCost, 6);
+    expect(combined.routerCost).toBeCloseTo(regionA.routerCost + regionB.routerCost, 6);
+    // Each region provisions its own router - two regions means two Laya fees, not one shared fee.
+    expect(combined.routerCost).toBeCloseTo(120, 6);
+    expect(combined.tiers).toHaveLength(regionA.tiers.length + regionB.tiers.length);
   });
 });
 

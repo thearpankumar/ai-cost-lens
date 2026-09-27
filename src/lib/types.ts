@@ -176,6 +176,25 @@ export interface RoutedApiCostBreakdown {
   savingsPct: number;
 }
 
+export interface SelfHostTierResult {
+  tier: "low" | "medium" | "high";
+  modelId: string;
+  docsPerMonth: number;
+  breakdown: SelfHostCostBreakdown;
+}
+
+export interface RoutedSelfHostCostBreakdown {
+  tiers: SelfHostTierResult[]; // active tiers only (medium omitted when disabled)
+  routerCost: number;
+  totalMonthlyCost: number;
+  costPerDocument: number;
+  annualCost: number;
+  baselineCost: number; // cost if 100% of volume used the High-tier model/hosting alone
+  savingsAmount: number;
+  savingsPct: number;
+  totalGpusNeeded: number;
+}
+
 // --- Multi-region compliance deployments ---
 
 export type RegionId = "us" | "eu" | "apac" | "australia";

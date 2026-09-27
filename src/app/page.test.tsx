@@ -111,6 +111,23 @@ describe("Home (calculator page)", () => {
     expect(screen.getAllByText(/500 docs\/mo/).length).toBe(2);
   });
 
+  it("enables self-hosted smart routing and shows a Laya-routed breakdown", async () => {
+    const user = userEvent.setup();
+    renderHome();
+
+    await waitFor(() => {
+      expect(screen.getByText(/server capacity used/i)).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("switch", { name: /enable smart routing/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Router (Laya)")).toBeInTheDocument();
+    });
+    // Server-capacity language belongs to the non-routed panel only
+    expect(screen.queryByText(/server capacity used/i)).not.toBeInTheDocument();
+  });
+
   it("opens the security and compliance safeguards dialog with its content", async () => {
     const user = userEvent.setup();
     renderHome();

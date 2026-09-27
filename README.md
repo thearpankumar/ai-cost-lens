@@ -45,10 +45,12 @@ understand tokens, GPUs, or model pricing tiers.
 - **Pay-per-use API estimator** - a catalog of mainstream commercial models (Anthropic, OpenAI,
   Google, Amazon, Mistral, xAI, Cohere) with live pricing, an intelligence/speed/price rating per
   model, and an instant cost breakdown for a given document volume and task.
-- **Smart model routing** - models a tiered routing setup (Low / Medium / High) where a lightweight
-  decision model classifies each request and only escalates the ones that need a more capable
-  model, with a structural guardrail that prevents a misconfigured setup from costing more than
-  using the top-tier model outright.
+- **Smart model routing** - available in both modes: a tiered setup (Low / Medium / High) where a
+  lightweight decision model (Jev or the open-source Laya) classifies each request and only
+  escalates the ones that need a more capable model. A structural guardrail only ever offers
+  cheaper tiers, so a misconfigured setup can't cost more than the top-tier model by mistake - on
+  the self-hosted side, the cost model also accounts for the reality that routing across separate
+  GPU deployments only pays off once volume is high enough to need more than one top-tier GPU.
 - **Multi-region compliance deployments** - splits volume across selected regions (US, EU,
   Asia-Pacific, Australia) with region-specific GPU pricing and an optional data-residency premium,
   since compliance-driven deployments cannot share infrastructure across borders.

@@ -8,10 +8,12 @@ import { CommercialModelCatalog } from "@/components/calculator/commercial-model
 import { OpenSourceModelCatalog } from "@/components/calculator/opensource-model-catalog";
 import { HostingSelector, type SelfHostConfig } from "@/components/calculator/hosting-selector";
 import { SmartRoutingPanel } from "@/components/calculator/smart-routing-panel";
+import { SelfHostRoutingPanel } from "@/components/calculator/self-host-routing-panel";
 import { RegionSelector } from "@/components/calculator/region-selector";
 import {
   ApiBreakdownPanel,
   RoutedApiBreakdownPanel,
+  RoutedSelfHostBreakdownPanel,
   SelfHostBreakdownPanel,
 } from "@/components/calculator/breakdown-panel";
 import { useLivePricing } from "@/lib/use-live-pricing";
@@ -22,12 +24,17 @@ import { REGIONS, DATA_RESIDENCY_PREMIUM_PCT } from "@/lib/data/regions";
 import {
   aggregateApiBreakdowns,
   aggregateRoutedApiBreakdowns,
+  aggregateRoutedSelfHostBreakdowns,
   aggregateSelfHostBreakdowns,
   calculateApiCost,
   calculateRoutedApiCost,
+  calculateRoutedSelfHostCost,
   calculateSelfHostCost,
   checkContextWindowFit,
+  estimateSelfHostMonthlyCost,
   getModelsCheaperThan,
+  getOpenSourceModelsCheaperThan,
+  scaleRoutedSelfHostBreakdown,
   scaleSelfHostBreakdown,
   splitDocsAcrossRegions,
   withDataResidencyPremium,
@@ -65,6 +72,21 @@ const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
   mediumRatePct: 0,
 };
 
+// Smallest-parameter open-source model (excluding the default main model) as
+// a reasonable static default Low tier for self-hosted routing.
+const DEFAULT_SELF_HOST_SMALL_MODEL_ID = [...OPEN_SOURCE_MODELS]
+  .filter((m) => m.id !== DEFAULT_OPEN_SOURCE_MODEL_ID)
+  .sort((a, b) => a.paramsB - b.paramsB)[0].id;
+
+const DEFAULT_SELF_HOST_ROUTING_CONFIG: RoutingConfig = {
+  enabled: false,
+  router: "laya",
+  escalationRatePct: DEFAULT_ESCALATION_RATE_PCT,
+  smallModelId: DEFAULT_SELF_HOST_SMALL_MODEL_ID,
+  mediumModelId: null,
+  mediumRatePct: 0,
+};
+
 function defaultHostConfig(): SelfHostConfig {
   const model = OPEN_SOURCE_MODELS.find((m) => m.id === DEFAULT_OPEN_SOURCE_MODEL_ID)!;
   const awsMatch = GPU_INSTANCES.find((i) => i.cloud === "AWS" && i.gpuType === model.minGpuType);
@@ -90,6 +112,9 @@ export default function Home() {
   const [selectedOpenSourceId, setSelectedOpenSourceId] = useState(DEFAULT_OPEN_SOURCE_MODEL_ID);
   const [hostConfig, setHostConfig] = useState<SelfHostConfig>(defaultHostConfig);
   const [routingConfig, setRoutingConfig] = useState<RoutingConfig>(DEFAULT_ROUTING_CONFIG);
+  const [selfHostRoutingConfig, setSelfHostRoutingConfig] = useState<RoutingConfig>(
+    DEFAULT_SELF_HOST_ROUTING_CONFIG,
+  );
   const [selectedRegions, setSelectedRegions] = useState<RegionId[]>(["us"]);
   const [useDataResidency, setUseDataResidency] = useState(false);
 
@@ -120,6 +145,15 @@ export default function Home() {
 
   const selectedRouter =
     ROUTER_OPTIONS.find((r) => r.id === routingConfig.router) ?? ROUTER_OPTIONS[0];
+
+  const selectedSelfHostSmallModel =
+    OPEN_SOURCE_MODELS.find((m) => m.id === selfHostRoutingConfig.smallModelId) ?? OPEN_SOURCE_MODELS[0];
+
+  const selectedSelfHostMediumModel = selfHostRoutingConfig.mediumModelId
+    ? (OPEN_SOURCE_MODELS.find((m) => m.id === selfHostRoutingConfig.mediumModelId) ?? null)
+    : null;
+
+  const layaRouter = ROUTER_OPTIONS.find((r) => r.id === "laya")!;
 
   // Structural guardrail: if the main model changes such that the current
   // Low/Medium routing tier is no longer cheaper than it, auto-correct to a
@@ -153,6 +187,40 @@ export default function Home() {
         next = { ...next, mediumModelId: null, mediumRatePct: 0 };
       }
       if (next !== routingConfig) setRoutingConfig(next);
+    }
+  }
+
+  // Same structural guardrail, for self-hosted routing: only open-source
+  // models genuinely cheaper to self-host than the selected "High" model are
+  // valid Low/Medium tiers.
+  const cheaperOssThanHigh = useMemo(
+    () => getOpenSourceModelsCheaperThan(workload, OPEN_SOURCE_MODELS, selectedOpenSourceModel),
+    [workload, selectedOpenSourceModel],
+  );
+  const cheaperOssKey = cheaperOssThanHigh
+    .map((m) => m.id)
+    .sort()
+    .join("|");
+  const [lastCheaperOssKey, setLastCheaperOssKey] = useState(cheaperOssKey);
+
+  if (cheaperOssKey !== lastCheaperOssKey) {
+    setLastCheaperOssKey(cheaperOssKey);
+    if (cheaperOssThanHigh.length === 0) {
+      if (selfHostRoutingConfig.enabled) {
+        setSelfHostRoutingConfig({ ...selfHostRoutingConfig, enabled: false });
+      }
+    } else {
+      const cheapestId = [...cheaperOssThanHigh].sort(
+        (a, b) => estimateSelfHostMonthlyCost(workload, a) - estimateSelfHostMonthlyCost(workload, b),
+      )[0].id;
+      let next = selfHostRoutingConfig;
+      if (!cheaperOssThanHigh.some((m) => m.id === next.smallModelId)) {
+        next = { ...next, smallModelId: cheapestId };
+      }
+      if (next.mediumModelId && !cheaperOssThanHigh.some((m) => m.id === next.mediumModelId)) {
+        next = { ...next, mediumModelId: null, mediumRatePct: 0 };
+      }
+      if (next !== selfHostRoutingConfig) setSelfHostRoutingConfig(next);
     }
   }
 
@@ -274,6 +342,90 @@ export default function Home() {
     [selfHostAllocations],
   );
 
+  // Derives hosting for a routing tier's model using the same cloud/pricing
+  // settings as the main HostingSelector, but matched to that tier's own
+  // recommended GPU type rather than the main model's.
+  function hostParamsForModel(model: (typeof OPEN_SOURCE_MODELS)[number]): HostParams {
+    if (hostConfig.location === "cloud") {
+      const match = GPU_INSTANCES.find(
+        (i) => i.cloud === hostConfig.cloudProvider && i.gpuType === model.minGpuType,
+      );
+      const fallback = GPU_INSTANCES.find((i) => i.gpuType === model.minGpuType) ?? selectedGpuInstance;
+      return {
+        kind: "cloud",
+        gpuInstance: match ?? fallback,
+        useReservedPricing: hostConfig.useReservedPricing,
+        opsOverheadPct: hostConfig.opsOverheadPct,
+      };
+    }
+    const ownedSpec =
+      OWNED_GPU_SPECS.find((s) => s.gpuType === model.minGpuType) ??
+      OWNED_GPU_SPECS.find((s) => s.gpuType === hostConfig.ownedGpuType)!;
+    return {
+      kind: "owned",
+      ownedGpu: ownedSpec,
+      hoursPerMonth: hostConfig.hoursPerDay * 30,
+      opsOverheadPct: hostConfig.opsOverheadPct,
+      depreciationYears: hostConfig.depreciationYears,
+    };
+  }
+
+  const selfHostRoutedAllocations = useMemo<RegionAllocation<ReturnType<typeof calculateRoutedSelfHostCost>>[]>(
+    () =>
+      selectedRegions.map((regionId, i) => {
+        const docsPerMonth = regionDocsSplit[i];
+        const regionalWorkload = { ...workload, docsPerMonth };
+        const highTier = { model: selectedOpenSourceModel, hostParams: hostParamsForModel(selectedOpenSourceModel) };
+        const lowTier = {
+          model: selectedSelfHostSmallModel,
+          hostParams: hostParamsForModel(selectedSelfHostSmallModel),
+        };
+        const mediumTier = selectedSelfHostMediumModel
+          ? { model: selectedSelfHostMediumModel, hostParams: hostParamsForModel(selectedSelfHostMediumModel) }
+          : null;
+        const base = calculateRoutedSelfHostCost(
+          regionalWorkload,
+          highTier,
+          lowTier,
+          layaRouter,
+          selfHostRoutingConfig.escalationRatePct,
+          mediumTier,
+          selfHostRoutingConfig.mediumRatePct,
+        );
+        const multiplier = REGIONS.find((r) => r.id === regionId)?.gpuPriceMultiplier ?? 1;
+        const breakdown = scaleRoutedSelfHostBreakdown(base, multiplier, docsPerMonth);
+        return { regionId, docsPerMonth, breakdown };
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- hostParamsForModel closes over hostConfig, already a dep
+    [
+      selectedRegions,
+      regionDocsSplit,
+      workload,
+      selectedOpenSourceModel,
+      selectedSelfHostSmallModel,
+      selectedSelfHostMediumModel,
+      layaRouter,
+      selfHostRoutingConfig.escalationRatePct,
+      selfHostRoutingConfig.mediumRatePct,
+      hostConfig,
+    ],
+  );
+
+  const selfHostRoutedBreakdown = useMemo(
+    () => aggregateRoutedSelfHostBreakdowns(selfHostRoutedAllocations),
+    [selfHostRoutedAllocations],
+  );
+
+  const regionalSelfHostRoutedRows = useMemo(
+    () =>
+      selfHostRoutedAllocations.map((a) => ({
+        regionId: a.regionId,
+        docsPerMonth: a.docsPerMonth,
+        totalMonthlyCost: a.breakdown.totalMonthlyCost,
+      })),
+    [selfHostRoutedAllocations],
+  );
+
   const apiContextWarning: ContextWindowWarning | undefined = useMemo(() => {
     const check = checkContextWindowFit(workload, selectedCommercialModel.contextWindow);
     if (check.fits && !check.nearLimit) return undefined;
@@ -326,19 +478,37 @@ export default function Home() {
                 onChange={setHostConfig}
                 model={selectedOpenSourceModel}
               />
+              <SelfHostRoutingPanel
+                config={selfHostRoutingConfig}
+                onChange={setSelfHostRoutingConfig}
+                models={OPEN_SOURCE_MODELS}
+                workload={workload}
+                highModel={selectedOpenSourceModel}
+              />
             </div>
             <div className="lg:col-span-1">
-              <SelfHostBreakdownPanel
-                model={selectedOpenSourceModel}
-                breakdown={selfHostBreakdown}
-                isOwned={hostConfig.location === "owned"}
-                locationLabel={
-                  hostConfig.location === "cloud"
-                    ? `${hostConfig.cloudProvider} (${selectedGpuInstance.gpuType})`
-                    : `your own ${hostConfig.ownedGpuType} server`
-                }
-                regionalBreakdowns={regionalSelfHostRows}
-              />
+              {selfHostRoutingConfig.enabled ? (
+                <RoutedSelfHostBreakdownPanel
+                  highModel={selectedOpenSourceModel}
+                  mediumModel={selectedSelfHostMediumModel}
+                  lowModel={selectedSelfHostSmallModel}
+                  isOwned={hostConfig.location === "owned"}
+                  breakdown={selfHostRoutedBreakdown}
+                  regionalBreakdowns={regionalSelfHostRoutedRows}
+                />
+              ) : (
+                <SelfHostBreakdownPanel
+                  model={selectedOpenSourceModel}
+                  breakdown={selfHostBreakdown}
+                  isOwned={hostConfig.location === "owned"}
+                  locationLabel={
+                    hostConfig.location === "cloud"
+                      ? `${hostConfig.cloudProvider} (${selectedGpuInstance.gpuType})`
+                      : `your own ${hostConfig.ownedGpuType} server`
+                  }
+                  regionalBreakdowns={regionalSelfHostRows}
+                />
+              )}
             </div>
           </div>
         </TabsContent>
