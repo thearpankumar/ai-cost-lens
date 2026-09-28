@@ -16,6 +16,7 @@ import {
   getOpenSourceModelsCheaperThan,
   getMonthlyTokenVolume,
   hasVramHeadroomWarning,
+  maxConcurrentSequencesFromVram,
   scaleRoutedSelfHostBreakdown,
   scaleSelfHostBreakdown,
   splitDocsAcrossRegions,
@@ -25,20 +26,24 @@ import {
   type SelfHostRoutingTier,
 } from "@/lib/calculations";
 import {
+  ASSUMED_AVG_CONTEXT_TOKENS_PER_CONCURRENT_USER,
   DEFAULT_CAPACITY_PROFILE,
   HOURS_PER_MONTH,
   INPUT_TOKEN_COMPUTE_WEIGHT,
+  KV_CACHE_MB_PER_TOKEN_PER_B_PARAMS,
+  KV_CACHE_USABLE_VRAM_FRACTION,
   TOKENS_PER_PAGE,
   UTILIZATION_TARGET,
   WEEKS_PER_MONTH,
 } from "@/lib/data/constants";
-import { OWN_SERVER_DEFAULTS } from "@/lib/data/gpu-instances";
+import { GPU_INSTANCES, OWN_SERVER_DEFAULTS, OWNED_GPU_SPECS } from "@/lib/data/gpu-instances";
 import { COMMERCIAL_MODELS } from "@/lib/data/commercial-models";
 import { OPEN_SOURCE_MODELS } from "@/lib/data/opensource-models";
 import { ROUTER_TOKENS_PER_DECISION } from "@/lib/data/routing";
 import type {
   CommercialModel,
   GpuInstance,
+  GpuType,
   OpenSourceModel,
   OwnedGpuSpec,
   RegionAllocation,
@@ -350,6 +355,96 @@ describe("calculateSelfHostCost - owned hardware", () => {
     });
     expect(longDepreciation.computeCostMonthly).toBeLessThan(shortDepreciation.computeCostMonthly);
   });
+
+  it("reports the one-time hardware purchase separately from the recurring monthly cost", () => {
+    const result = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, ownedParams);
+
+    // 1 GPU * $10,000 * 1.4 server overhead = $14,000 one-time; / 24 months = $583.33/mo amortized
+    expect(result.hardwareCostOneTimeUsd).toBeCloseTo(14_000, 6);
+    expect(result.computeCostMonthly).toBeCloseTo(14_000 / 24, 6);
+    // electricity $12.775 + ops ($583.33 + $12.775) * 0.3 = $178.83 -> recurring $191.61/mo
+    expect(result.recurringMonthlyCostExclHardware).toBeCloseTo(
+      result.electricityCostMonthly + result.overheadCostMonthly,
+      6,
+    );
+    expect(result.recurringMonthlyCostExclHardware).toBeCloseTo(191.6075, 3);
+    // Recurring excludes exactly the amortized hardware slice; the total
+    // comparison figure is unchanged: $191.61 + $583.33 = $774.94/mo.
+    expect(result.recurringMonthlyCostExclHardware).toBeCloseTo(
+      result.totalMonthlyCost - result.computeCostMonthly,
+      6,
+    );
+    expect(result.totalMonthlyCost).toBeCloseTo(774.9408, 3);
+  });
+
+  it("matches a hand-computed capex/opex split for a real 2x H100 model (Nemotron 3 Super)", () => {
+    const nemotronSuper = OPEN_SOURCE_MODELS.find((m) => m.id === "nemotron-3-super")!;
+    const h100 = OWNED_GPU_SPECS.find((s) => s.gpuType === "H100-80GB")!;
+    const result = calculateSelfHostCost(baseWorkload, nemotronSuper, {
+      kind: "owned",
+      ownedGpu: h100,
+      opsOverheadPct: 0.3,
+      depreciationYears: 3,
+    });
+
+    // Batch volume (4.28 tok/s) fits one replica = 2 GPUs.
+    expect(result.gpusNeeded).toBe(2);
+    // 2 GPUs * $28,000 * 1.4 overhead = $78,400 one-time; / 36 months = $2,177.78/mo amortized
+    expect(result.hardwareCostOneTimeUsd).toBeCloseTo(78_400, 6);
+    expect(result.computeCostMonthly).toBeCloseTo(2177.7778, 3);
+    // 2 * 700W * 1.4 PUE = 1.96 kW * 217.2619 h * $0.14 = $59.62 electricity
+    expect(result.electricityCostMonthly).toBeCloseTo(59.6167, 3);
+    // ops: ($2,177.78 + $59.62) * 0.3 = $671.22 -> recurring $59.62 + $671.22 = $730.84/mo
+    expect(result.recurringMonthlyCostExclHardware).toBeCloseTo(730.835, 2);
+    // comparison total: $730.84 + $2,177.78 = $2,908.61/mo
+    expect(result.totalMonthlyCost).toBeCloseTo(2908.6128, 3);
+  });
+});
+
+describe("calculateSelfHostCost - cloud rental has no one-time hardware cost", () => {
+  it("reports zero capex and a recurring cost equal to the full monthly total", () => {
+    const result = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, {
+      kind: "cloud",
+      gpuInstance: syntheticGpuInstance,
+      useReservedPricing: false,
+      opsOverheadPct: 0.25,
+    });
+    // 1 GPU * $3/hr * 730h = $2,190 rental; * 1.25 ops = $2,737.50, all of it recurring
+    expect(result.hardwareCostOneTimeUsd).toBe(0);
+    expect(result.recurringMonthlyCostExclHardware).toBeCloseTo(2737.5, 6);
+    expect(result.recurringMonthlyCostExclHardware).toBe(result.totalMonthlyCost);
+  });
+
+  it("scales and aggregates the capex/recurring fields like the other cost fields", () => {
+    const owned: HostParams = {
+      kind: "owned",
+      ownedGpu: syntheticOwnedGpu,
+      opsOverheadPct: 0.3,
+      depreciationYears: 2,
+    };
+    const regionA = calculateSelfHostCost({ ...baseWorkload, docsPerMonth: 400 }, syntheticOpenSourceModel, owned);
+    const regionB = calculateSelfHostCost({ ...baseWorkload, docsPerMonth: 600 }, syntheticOpenSourceModel, owned);
+
+    // Regional multiplier 1.3: $14,000 -> $18,200 one-time
+    const scaled = scaleSelfHostBreakdown(regionA, 1.3, 400);
+    expect(scaled.hardwareCostOneTimeUsd).toBeCloseTo(18_200, 6);
+    expect(scaled.recurringMonthlyCostExclHardware).toBeCloseTo(regionA.recurringMonthlyCostExclHardware * 1.3, 6);
+    expect(scaled.recurringMonthlyCostExclHardware).toBeCloseTo(
+      scaled.totalMonthlyCost - scaled.computeCostMonthly,
+      6,
+    );
+
+    // Two independent regions each buy their own server: $14,000 + $14,000 = $28,000
+    const combined = aggregateSelfHostBreakdowns([
+      { regionId: "us", docsPerMonth: 400, breakdown: regionA },
+      { regionId: "eu", docsPerMonth: 600, breakdown: regionB },
+    ]);
+    expect(combined.hardwareCostOneTimeUsd).toBeCloseTo(28_000, 6);
+    expect(combined.recurringMonthlyCostExclHardware).toBeCloseTo(
+      regionA.recurringMonthlyCostExclHardware + regionB.recurringMonthlyCostExclHardware,
+      6,
+    );
+  });
 });
 
 const bigModel: CommercialModel = { ...syntheticCommercialModel, inputPricePerM: 2, outputPricePerM: 10 };
@@ -581,6 +676,16 @@ describe("scaleSelfHostBreakdown", () => {
   });
 });
 
+// Resolves each model to a first-listed cloud instance of its own recommended
+// GPU type, on-demand and always-on - a stand-in for page.tsx's
+// hostParamsForModel with default settings.
+const resolveOnDemandHostParams = (model: OpenSourceModel): HostParams => ({
+  kind: "cloud",
+  gpuInstance: GPU_INSTANCES.find((i) => i.gpuType === model.minGpuType)!,
+  useReservedPricing: false,
+  opsOverheadPct: 0.25,
+});
+
 describe("getOpenSourceModelsCheaperThan", () => {
   it("returns only open-source models genuinely cheaper to self-host than the reference model", () => {
     const cheapModel: OpenSourceModel = { ...syntheticOpenSourceModel, id: "test/oss-cheap", minGpuType: "L4" };
@@ -590,10 +695,14 @@ describe("getOpenSourceModelsCheaperThan", () => {
       minGpuType: "H100-80GB",
       minGpuCount: 4,
     };
+    // reference: 1x A100-80GB (Azure $3.673/hr) * 730h * 1.25 ops = $3,351.61/mo
+    // cheap:     1x L4 (AWS $0.8048/hr)        = $734.38/mo
+    // pricier:   4x H100 (AWS $6.88/hr)        = $25,112/mo
     const result = getOpenSourceModelsCheaperThan(
       baseWorkload,
       [syntheticOpenSourceModel, cheapModel, pricierModel],
       syntheticOpenSourceModel,
+      resolveOnDemandHostParams,
     );
     const ids = result.map((m) => m.id);
     expect(ids).toContain(cheapModel.id);
@@ -603,9 +712,14 @@ describe("getOpenSourceModelsCheaperThan", () => {
 });
 
 const highOssModel: OpenSourceModel = { ...syntheticOpenSourceModel, id: "test/oss-high" };
+// An 8B-class model sized for a 24GB L4 (6GB 4-bit weights), like the
+// catalog's efficient tier - a 70B/40GB model can't physically load on an L4.
 const lowOssModel: OpenSourceModel = {
   ...syntheticOpenSourceModel,
   id: "test/oss-low",
+  paramsB: 8,
+  vramFp16GB: 16,
+  vramInt4GB: 6,
   minGpuType: "L4",
   throughputTokPerSecOnBaseline: 1800,
 };
@@ -889,28 +1003,43 @@ describe("calculateSelfHostCost - batch operating window", () => {
   });
 });
 
-describe("calculateSelfHostCost - interactive (live users) pattern", () => {
-  const interactive = (peakConcurrentUsers: number, targetTokPerSecPerUser = 20): WorkloadInputs => ({
-    ...baseWorkload,
-    capacity: { ...DEFAULT_CAPACITY_PROFILE, pattern: "interactive", peakConcurrentUsers, targetTokPerSecPerUser },
-  });
+const interactive = (peakConcurrentUsers: number, targetTokPerSecPerUser = 20): WorkloadInputs => ({
+  ...baseWorkload,
+  capacity: { ...DEFAULT_CAPACITY_PROFILE, pattern: "interactive", peakConcurrentUsers, targetTokPerSecPerUser },
+});
 
+// Same 1000 tok/s A100 model, but with an 8B-class KV footprint so GPU
+// memory is never the binding constraint in these throughput-focused tests:
+// KV/seq = 8 * 0.0043 MiB * 4096 = 140.9024 MiB; (80 - 6) GB * 0.85 = 62.9 GiB
+// -> floor(64,409.6 / 140.9024) = floor(457.12) = 457 sequences/replica
+// (2 GPUs: 130.9 GiB = 134,041.6 MiB -> 951), far above every throughput
+// bound used below (at most 100 users/replica).
+const lightKvModel: OpenSourceModel = {
+  ...syntheticOpenSourceModel,
+  id: "test/oss-light-kv",
+  paramsB: 8,
+  vramFp16GB: 16,
+  vramInt4GB: 6,
+};
+
+describe("calculateSelfHostCost - interactive (live users) pattern", () => {
   it("sizes for peak concurrency even when monthly volume alone would fit one replica", () => {
     // Volume: 4.28 tok/s -> 1 replica.
-    // Concurrency: one replica serves floor(1000 * 0.8 / 20) = 40 users at 20 tok/s;
-    // 100 users -> ceil(100 / 40) = 3 replicas.
-    const result = calculateSelfHostCost(interactive(100), syntheticOpenSourceModel, a100CloudParams);
+    // Concurrency: one replica serves floor(1000 * 0.8 / 20) = 40 users at 20 tok/s
+    // (VRAM allows 457, so throughput binds); 100 users -> ceil(100 / 40) = 3 replicas.
+    const result = calculateSelfHostCost(interactive(100), lightKvModel, a100CloudParams);
     expect(result.replicas).toBe(3);
     expect(result.gpusNeeded).toBe(3);
     expect(result.limitingFactor).toBe("concurrency");
+    expect(result.concurrencyBound).toBe("throughput");
     expect(result.peakConcurrentUsers).toBe(100);
 
-    const sameVolumeAsBatch = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, a100CloudParams);
+    const sameVolumeAsBatch = calculateSelfHostCost(baseWorkload, lightKvModel, a100CloudParams);
     expect(sameVolumeAsBatch.gpusNeeded).toBe(1);
   });
 
   it("multiplies concurrency replicas by minGpuCount for multi-GPU models", () => {
-    const twoGpuModel = { ...syntheticOpenSourceModel, minGpuCount: 2 };
+    const twoGpuModel = { ...lightKvModel, minGpuCount: 2 };
     const result = calculateSelfHostCost(interactive(100), twoGpuModel, a100CloudParams);
     expect(result.replicas).toBe(3);
     expect(result.gpusNeeded).toBe(6);
@@ -918,10 +1047,10 @@ describe("calculateSelfHostCost - interactive (live users) pattern", () => {
 
   it("needs more replicas for a snappier per-user speed target", () => {
     // 40 tok/s per user -> floor(800 / 40) = 20 users per replica -> ceil(100 / 20) = 5 replicas
-    const snappy = calculateSelfHostCost(interactive(100, 40), syntheticOpenSourceModel, a100CloudParams);
+    const snappy = calculateSelfHostCost(interactive(100, 40), lightKvModel, a100CloudParams);
     expect(snappy.replicas).toBe(5);
     // 8 tok/s -> floor(800 / 8) = 100 users per replica -> 1 replica
-    const reading = calculateSelfHostCost(interactive(100, 8), syntheticOpenSourceModel, a100CloudParams);
+    const reading = calculateSelfHostCost(interactive(100, 8), lightKvModel, a100CloudParams);
     expect(reading.replicas).toBe(1);
   });
 
@@ -933,6 +1062,108 @@ describe("calculateSelfHostCost - interactive (live users) pattern", () => {
     const result = calculateSelfHostCost(batchWithUsers, syntheticOpenSourceModel, a100CloudParams);
     expect(result.replicas).toBe(1);
     expect(result.peakConcurrentUsers).toBe(0);
+    expect(result.concurrencyBound).toBeUndefined();
+  });
+});
+
+describe("calculateSelfHostCost - concurrency is capped by GPU memory (KV cache), not just throughput", () => {
+  it("maxConcurrentSequencesFromVram: 70B dense model on one 80GB A100", () => {
+    // KV/token = 70B * 0.0043 MiB = 0.301 MiB; * 4096 tokens = 1,232.896 MiB per sequence
+    // headroom = (80 - 40) GB * 0.85 = 34 GiB = 34,816 MiB -> floor(34,816 / 1,232.896) = floor(28.24) = 28
+    expect(KV_CACHE_MB_PER_TOKEN_PER_B_PARAMS).toBe(0.0043);
+    expect(KV_CACHE_USABLE_VRAM_FRACTION).toBe(0.85);
+    expect(ASSUMED_AVG_CONTEXT_TOKENS_PER_CONCURRENT_USER).toBe(4096);
+    expect(maxConcurrentSequencesFromVram(syntheticOpenSourceModel, "A100-80GB", 1)).toBe(28);
+    // 2 GPUs: (160 - 40) * 0.85 = 102 GiB = 104,448 MiB -> floor(104,448 / 1,232.896) = floor(84.72) = 84
+    expect(maxConcurrentSequencesFromVram(syntheticOpenSourceModel, "A100-80GB", 2)).toBe(84);
+    // Shorter assumed context -> more sequences: 2048 tokens -> 616.448 MiB -> floor(56.48) = 56
+    expect(maxConcurrentSequencesFromVram(syntheticOpenSourceModel, "A100-80GB", 1, 2048)).toBe(56);
+  });
+
+  it("maxConcurrentSequencesFromVram never drops below 1, even with no headroom", () => {
+    // 40GB weights on a 24GB L4: max(0, 24 - 40) = 0 headroom -> floored at 1
+    expect(maxConcurrentSequencesFromVram(syntheticOpenSourceModel, "L4", 1)).toBe(1);
+  });
+
+  it("MoE models scale KV cache off ACTIVE params, not total params", () => {
+    const gptOss120b = OPEN_SOURCE_MODELS.find((m) => m.id === "gpt-oss-120b")!;
+    // 5.1B active * 0.0043 MiB * 4096 = 89.82528 MiB/seq; (80 - 65) GB * 0.85 = 12.75 GiB = 13,056 MiB
+    // -> floor(13,056 / 89.82528) = floor(145.35) = 145
+    // (using 117B total params: 2,060.6976 MiB/seq -> floor(6.34) = 6)
+    expect(maxConcurrentSequencesFromVram(gptOss120b, "H100-80GB", 1)).toBe(145);
+  });
+
+  it("regression: a 70B model on one A100 is memory-bound - needs more replicas than throughput alone implies", () => {
+    // Throughput-only: floor(1000 * 0.8 / 20) = 40 users/replica -> ceil(100 / 40) = 3 replicas (old answer)
+    // VRAM: 28 sequences/replica -> min(40, 28) = 28 -> ceil(100 / 28) = ceil(3.57) = 4 replicas
+    const result = calculateSelfHostCost(interactive(100), syntheticOpenSourceModel, a100CloudParams);
+    const naiveThroughputOnlyReplicas = Math.ceil(100 / Math.floor((1000 * 0.8) / 20));
+    expect(naiveThroughputOnlyReplicas).toBe(3);
+    expect(result.replicas).toBe(4);
+    expect(result.gpusNeeded).toBe(4);
+    expect(result.gpusNeeded).toBeGreaterThan(naiveThroughputOnlyReplicas);
+    expect(result.limitingFactor).toBe("concurrency");
+    expect(result.concurrencyBound).toBe("vram");
+    // 4 GPUs * $3/hr * 730h = $8,760
+    expect(result.computeCostMonthly).toBeCloseTo(4 * 3 * 730, 5);
+  });
+
+  it("regression: a fast, low-active-param MoE (GPT-OSS 120B on H100) at 1,000 reading-speed users is memory-bound", () => {
+    const gptOss120b = OPEN_SOURCE_MODELS.find((m) => m.id === "gpt-oss-120b")!;
+    const h100Params: HostParams = {
+      ...a100CloudParams,
+      gpuInstance: { ...syntheticGpuInstance, gpuType: "H100-80GB" },
+    };
+    // At 8 tok/s ("reading speed"), throughput: 2500 tok/s on its own H100 baseline * 0.8 / 8
+    //   = 250 users/replica -> ceil(1000 / 250) = 4 replicas under the old throughput-only math
+    // VRAM: 145 sequences/replica -> min(250, 145) = 145 -> ceil(1000 / 145) = ceil(6.90) = 7 replicas
+    const result = calculateSelfHostCost(interactive(1000, 8), gptOss120b, h100Params);
+    expect(result.gpuThroughputTokPerSec).toBeCloseTo(2500, 6);
+    expect(result.replicas).toBe(7);
+    expect(result.gpusNeeded).toBe(7);
+    expect(result.gpusNeeded).toBeGreaterThan(4);
+    expect(result.concurrencyBound).toBe("vram");
+  });
+
+  it("GPT-OSS 120B at 20 tok/s/user is throughput-bound (memory has room for 145, compute only 100)", () => {
+    const gptOss120b = OPEN_SOURCE_MODELS.find((m) => m.id === "gpt-oss-120b")!;
+    const h100Params: HostParams = {
+      ...a100CloudParams,
+      gpuInstance: { ...syntheticGpuInstance, gpuType: "H100-80GB" },
+    };
+    // Throughput: 2500 * 0.8 / 20 = 100 users/replica < 145 VRAM -> ceil(1000 / 100) = 10 replicas
+    const result = calculateSelfHostCost(interactive(1000), gptOss120b, h100Params);
+    expect(result.replicas).toBe(10);
+    expect(result.concurrencyBound).toBe("throughput");
+  });
+
+  it("stays throughput-bound when VRAM has room to spare (Nemotron 3 Super on 2x H100)", () => {
+    const nemotronSuper = OPEN_SOURCE_MODELS.find((m) => m.id === "nemotron-3-super")!;
+    const h100Params: HostParams = {
+      ...a100CloudParams,
+      gpuInstance: { ...syntheticGpuInstance, gpuType: "H100-80GB" },
+    };
+    // Throughput: 700 tok/s * 0.8 / 20 = 28 users/replica
+    // VRAM: 12B active * 0.0043 * 4096 = 211.3536 MiB/seq; (160 - 60) * 0.85 = 85 GiB = 87,040 MiB
+    //   -> floor(411.82) = 411 sequences - not binding
+    // -> min(28, 411) = 28 -> ceil(100 / 28) = 4 replicas = 8 GPUs
+    expect(maxConcurrentSequencesFromVram(nemotronSuper, "H100-80GB", 2)).toBe(411);
+    const result = calculateSelfHostCost(interactive(100), nemotronSuper, h100Params);
+    expect(result.replicas).toBe(4);
+    expect(result.gpusNeeded).toBe(8);
+    expect(result.limitingFactor).toBe("concurrency");
+    expect(result.concurrencyBound).toBe("throughput");
+  });
+
+  it("omits concurrencyBound when volume (not concurrency) sets the replica count", () => {
+    // 3 users need 1 replica for concurrency, but 200,000 docs need 2 for volume
+    const result = calculateSelfHostCost(
+      { ...interactive(3), docsPerMonth: 200_000 },
+      syntheticOpenSourceModel,
+      a100CloudParams,
+    );
+    expect(result.limitingFactor).toBe("volume");
+    expect(result.concurrencyBound).toBeUndefined();
   });
 });
 
@@ -1084,13 +1315,20 @@ describe("Routing and regions split peak concurrent users proportionally", () =>
     const high = result.tiers.find((t) => t.tier === "high")!;
     const low = result.tiers.find((t) => t.tier === "low")!;
 
-    // High: 25 users; 1000 tok/s * 0.8 / 20 = 40 users/replica -> 1 replica
+    // High: 25 users; throughput 1000 tok/s * 0.8 / 20 = 40 users/replica, VRAM
+    // (70B on one 80GB A100) holds 28 sequences -> min(40, 28) = 28 -> ceil(25 / 28) = 1 replica
+    // (one replica is the minimum footprint, so no concurrency bound is reported)
     expect(high.breakdown.peakConcurrentUsers).toBe(25);
     expect(high.breakdown.replicas).toBe(1);
-    // Low: 75 users; L4 model at 1800 tok/s * 0.8 / 20 = 72 users/replica -> 2 replicas
+    expect(high.breakdown.limitingFactor).toBe("minimum-footprint");
+    expect(high.breakdown.concurrencyBound).toBeUndefined();
+    // Low: 75 users; L4 8B model: throughput 1800 * 0.8 / 20 = 72 users/replica;
+    // VRAM (24 - 6) GB * 0.85 = 15.3 GiB = 15,667.2 MiB / 140.9024 MiB = floor(111.19) = 111
+    // -> min(72, 111) = 72 -> ceil(75 / 72) = 2 replicas
     expect(low.breakdown.peakConcurrentUsers).toBe(75);
     expect(low.breakdown.replicas).toBe(2);
     expect(low.breakdown.limitingFactor).toBe("concurrency");
+    expect(low.breakdown.concurrencyBound).toBe("throughput");
   });
 
   it("withWorkloadShare scales peak users and sets the region's docs", () => {
@@ -1111,8 +1349,10 @@ describe("Routing and regions split peak concurrent users proportionally", () =>
       syntheticOpenSourceModel,
       a100CloudParams,
     );
-    // 50 users per region / 40 per replica -> 2 replicas each
+    // 50 users per region; VRAM caps a replica at 28 sequences (throughput would allow 40)
+    // -> ceil(50 / 28) = ceil(1.79) = 2 replicas each
     expect(regionA.replicas).toBe(2);
+    expect(regionA.concurrencyBound).toBe("vram");
     const combined = aggregateSelfHostBreakdowns([
       { regionId: "us", docsPerMonth: 500, breakdown: regionA },
       { regionId: "eu", docsPerMonth: 500, breakdown: regionB },
@@ -1120,6 +1360,7 @@ describe("Routing and regions split peak concurrent users proportionally", () =>
     expect(combined.replicas).toBe(4);
     expect(combined.gpusNeeded).toBe(4);
     expect(combined.limitingFactor).toBe("concurrency");
+    expect(combined.concurrencyBound).toBe("vram");
     expect(combined.peakConcurrentUsers).toBe(100);
     expect(combined.vramHeadroomWarning).toBe(false);
     // scaling for a regional price multiplier preserves the new fields
@@ -1132,11 +1373,104 @@ describe("Routing and regions split peak concurrent users proportionally", () =>
 describe("estimateSelfHostMonthlyCost uses the workload's usage pattern", () => {
   it("costs more under an interactive pattern that needs more replicas", () => {
     const llama70b = OPEN_SOURCE_MODELS.find((m) => m.id === "llama-3.3-70b")!;
-    const batch = estimateSelfHostMonthlyCost(baseWorkload, llama70b);
-    const interactive = estimateSelfHostMonthlyCost(
-      { ...baseWorkload, capacity: { ...DEFAULT_CAPACITY_PROFILE, pattern: "interactive", peakConcurrentUsers: 200 } },
-      llama70b,
+    // Batch: 1 replica -> 1 GPU * $3/hr * 730h * 1.25 = $2,737.50
+    const batch = estimateSelfHostMonthlyCost(baseWorkload, llama70b, a100CloudParams);
+    expect(batch).toBeCloseTo(2737.5, 6);
+    // 200 live users: throughput 600 * 0.8 / 20 = 24 users/replica; VRAM holds 28
+    // -> min(24, 28) = 24 -> ceil(200 / 24) = ceil(8.33) = 9 GPUs * $2,737.50 = $24,637.50
+    const interactiveCost = estimateSelfHostMonthlyCost(interactive(200), llama70b, a100CloudParams);
+    expect(interactiveCost).toBeCloseTo(9 * 2737.5, 6);
+    expect(interactiveCost).toBeGreaterThan(batch);
+  });
+});
+
+describe("estimateSelfHostMonthlyCost follows the hosting settings it is given (catalog preview)", () => {
+  const nemotronSuper = OPEN_SOURCE_MODELS.find((m) => m.id === "nemotron-3-super")!;
+  const awsH100 = GPU_INSTANCES.find((i) => i.id === "aws-p5-48xlarge")!;
+  const awsOnDemandAlwaysOn: HostParams = {
+    kind: "cloud",
+    gpuInstance: awsH100,
+    useReservedPricing: false,
+    opsOverheadPct: 0.25,
+  };
+
+  const hostParamsFor = (overrides: Partial<Record<GpuType, HostParams>>) => (model: OpenSourceModel) =>
+    overrides[model.minGpuType] ?? resolveOnDemandHostParams(model);
+
+  it("regression: returns different costs for different hosting setups (no longer hardcoded to AWS on-demand)", () => {
+    // Old hardcoded preview: 2 H100s * $6.88/hr * 730h = $10,044.80; * 1.25 ops = $12,556/mo
+    const onDemand = estimateSelfHostMonthlyCost(baseWorkload, nemotronSuper, awsOnDemandAlwaysOn);
+    expect(onDemand).toBeCloseTo(12_556, 6);
+
+    // Scale-down: 228.125 billed h -> 2 * $6.88 * 228.125 = $3,139.00; * 1.25 = $3,923.75/mo
+    const scaleDown = estimateSelfHostMonthlyCost(baseWorkload, nemotronSuper, {
+      ...awsOnDemandAlwaysOn,
+      scaleDownOutsideActiveHours: true,
+    });
+    expect(scaleDown).toBeCloseTo(3923.75, 6);
+
+    // Reserved (57% off): $6.88 * 0.43 = $2.9584/hr * 2 * 730h = $4,319.26; * 1.25 = $5,399.08/mo
+    const reserved = estimateSelfHostMonthlyCost(baseWorkload, nemotronSuper, {
+      ...awsOnDemandAlwaysOn,
+      useReservedPricing: true,
+    });
+    expect(reserved).toBeCloseTo(5399.08, 2);
+
+    // Owned (3 yr, 30% ops): $78,400 / 36 = $2,177.78 + $59.62 power + $671.22 ops = $2,908.61/mo
+    const owned = estimateSelfHostMonthlyCost(baseWorkload, nemotronSuper, {
+      kind: "owned",
+      ownedGpu: OWNED_GPU_SPECS.find((s) => s.gpuType === "H100-80GB")!,
+      opsOverheadPct: 0.3,
+      depreciationYears: 3,
+    });
+    expect(owned).toBeCloseTo(2908.6128, 3);
+
+    expect(new Set([onDemand, scaleDown, reserved, owned]).size).toBe(4);
+  });
+
+  it("acceptance: the catalog card price for the High-tier model matches the routing panel's baseline", () => {
+    // Both now go through calculateSelfHostCost with identical workload + hostParams,
+    // so the full-volume catalog preview and the routing "always use High" baseline agree.
+    const userHosting: HostParams = { ...awsOnDemandAlwaysOn, scaleDownOutsideActiveHours: true };
+    const resolve = hostParamsFor({ "H100-80GB": userHosting });
+    const catalogCardPrice = estimateSelfHostMonthlyCost(baseWorkload, nemotronSuper, resolve(nemotronSuper));
+    const routed = calculateRoutedSelfHostCost(
+      baseWorkload,
+      { model: nemotronSuper, hostParams: resolve(nemotronSuper) },
+      { model: lowOssModel, hostParams: resolve(lowOssModel) },
+      laya,
+      0.25,
     );
-    expect(interactive).toBeGreaterThan(batch);
+    // $3,923.75 in both places (previously the card showed $12,556 regardless of settings)
+    expect(catalogCardPrice).toBeCloseTo(3923.75, 6);
+    expect(routed.baselineCost).toBe(catalogCardPrice);
+  });
+
+  it("getOpenSourceModelsCheaperThan resolves each model's own hosting through the callback", () => {
+    // A 1x A100-80GB model on cloud rental costs $3,351.61/mo. That is cheaper than
+    // Nemotron 3 Super on AWS on-demand ($12,556/mo), but NOT cheaper than Nemotron 3
+    // Super on owned H100s ($2,908.61/mo) - the guardrail must use the resolved hosting.
+    const a100Model: OpenSourceModel = { ...syntheticOpenSourceModel, id: "test/a100-model" };
+    const ownedH100: HostParams = {
+      kind: "owned",
+      ownedGpu: OWNED_GPU_SPECS.find((s) => s.gpuType === "H100-80GB")!,
+      opsOverheadPct: 0.3,
+      depreciationYears: 3,
+    };
+    const cheaperVsOnDemand = getOpenSourceModelsCheaperThan(
+      baseWorkload,
+      [nemotronSuper, a100Model],
+      nemotronSuper,
+      hostParamsFor({ "H100-80GB": awsOnDemandAlwaysOn }),
+    );
+    expect(cheaperVsOnDemand.map((m) => m.id)).toEqual([a100Model.id]);
+
+    const cheaperVsOwned = getOpenSourceModelsCheaperThan(
+      baseWorkload,
+      [nemotronSuper, a100Model],
+      nemotronSuper,
+      hostParamsFor({ "H100-80GB": ownedH100 }),
+    );
+    expect(cheaperVsOwned).toHaveLength(0);
   });
 });

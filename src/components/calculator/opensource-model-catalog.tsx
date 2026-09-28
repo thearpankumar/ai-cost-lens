@@ -13,7 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { IntelligenceMeter, PriceTierBadge } from "@/components/calculator/rating-widgets";
-import { estimateSelfHostMonthlyCost } from "@/lib/calculations";
+import { estimateSelfHostMonthlyCost, type ResolveHostParams } from "@/lib/calculations";
 import { familyLogos } from "@/lib/data/logos";
 import { formatUsd } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -27,6 +27,9 @@ interface OpenSourceModelCatalogProps {
   workload: WorkloadInputs;
   selectedId: string;
   onSelect: (id: string) => void;
+  // Resolves each model's hosting from the user's current hosting settings,
+  // so card prices match the breakdown/routing panels.
+  hostParamsForModel: ResolveHostParams;
 }
 
 export function OpenSourceModelCatalog({
@@ -34,6 +37,7 @@ export function OpenSourceModelCatalog({
   workload,
   selectedId,
   onSelect,
+  hostParamsForModel,
 }: OpenSourceModelCatalogProps) {
   const [sort, setSort] = useState<SortMode>("cheapest");
   const [taskFilterOn, setTaskFilterOn] = useState(true);
@@ -47,7 +51,7 @@ export function OpenSourceModelCatalog({
   const rows = useMemo(() => {
     const withCost = filteredModels.map((model) => ({
       model,
-      monthlyCost: estimateSelfHostMonthlyCost(workload, model),
+      monthlyCost: estimateSelfHostMonthlyCost(workload, model, hostParamsForModel(model)),
     }));
 
     return withCost.sort((a, b) => {
@@ -55,7 +59,7 @@ export function OpenSourceModelCatalog({
       if (sort === "smartest") return b.model.intelligenceScore - a.model.intelligenceScore;
       return a.model.paramsB - b.model.paramsB;
     });
-  }, [filteredModels, workload, sort]);
+  }, [filteredModels, workload, sort, hostParamsForModel]);
 
   return (
     <div className="space-y-3 @container">
@@ -141,7 +145,7 @@ export function OpenSourceModelCatalog({
                   <span className="text-xs font-normal text-muted-foreground">/mo</span>
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  on its recommended GPU, AWS on-demand
+                  on its recommended GPU, with your current hosting settings
                 </p>
               </div>
 

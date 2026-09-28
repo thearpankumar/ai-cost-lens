@@ -9,6 +9,7 @@ import type {
   RouterOption,
   RoutedApiCostBreakdown,
   RoutedSelfHostCostBreakdown,
+  SelfHostConcurrencyBound,
   SelfHostCostBreakdown,
   SelfHostLimitingFactor,
   SelfHostTierResult,
@@ -16,11 +17,14 @@ import type {
 } from "@/lib/types";
 import type { RegionAllocation } from "@/lib/types";
 import {
+  ASSUMED_AVG_CONTEXT_TOKENS_PER_CONCURRENT_USER,
   ASSUMED_CACHEABLE_INPUT_FRACTION,
   BATCH_API_PRICE_MULTIPLIER,
   DOC_SIZE_PRESETS,
   HOURS_PER_MONTH,
   INPUT_TOKEN_COMPUTE_WEIGHT,
+  KV_CACHE_MB_PER_TOKEN_PER_B_PARAMS,
+  KV_CACHE_USABLE_VRAM_FRACTION,
   SCALE_DOWN_SPINUP_HOURS_PER_ACTIVE_DAY,
   TASK_PRESETS,
   TOKENS_PER_PAGE,
@@ -28,12 +32,7 @@ import {
   WEEKS_PER_MONTH,
 } from "@/lib/data/constants";
 import { GPU_THROUGHPUT_MULTIPLIER } from "@/lib/data/opensource-models";
-import {
-  CLOUD_OPS_OVERHEAD_DEFAULT_PCT,
-  GPU_INSTANCES,
-  GPU_VRAM_GB,
-  OWN_SERVER_DEFAULTS,
-} from "@/lib/data/gpu-instances";
+import { GPU_VRAM_GB, OWN_SERVER_DEFAULTS } from "@/lib/data/gpu-instances";
 import { ROUTER_TOKENS_PER_DECISION } from "@/lib/data/routing";
 
 export function getDocTokens(workload: WorkloadInputs): number {
@@ -195,6 +194,34 @@ export function hasVramHeadroomWarning(model: OpenSourceModel, gpuType: GpuType)
   return model.vramInt4GB * 1.1 > GPU_VRAM_GB[gpuType] * model.minGpuCount;
 }
 
+/** Rough KV-cache bytes/token for a model, scaled off active params (MoE) or total params (dense). */
+function approxKvCacheBytesPerToken(model: OpenSourceModel): number {
+  const scaleParamsB = model.activeParamsB ?? model.paramsB;
+  return scaleParamsB * KV_CACHE_MB_PER_TOKEN_PER_B_PARAMS * 1024 * 1024;
+}
+
+/**
+ * Max concurrent sequences one replica's VRAM can hold, given spare memory
+ * after model weights. This is frequently the REAL bottleneck for interactive
+ * serving, not raw compute throughput - continuous batching (vLLM/TGI) is
+ * often memory-bound rather than compute-bound.
+ *
+ * Uses the 4-bit weights footprint (vramInt4GB) regardless of configured
+ * precision, consistent with hasVramHeadroomWarning().
+ */
+export function maxConcurrentSequencesFromVram(
+  model: OpenSourceModel,
+  gpuType: GpuType,
+  minGpuCount: number,
+  avgContextTokens: number = ASSUMED_AVG_CONTEXT_TOKENS_PER_CONCURRENT_USER,
+): number {
+  const totalVramGB = GPU_VRAM_GB[gpuType] * minGpuCount;
+  const kvHeadroomBytes =
+    Math.max(0, totalVramGB - model.vramInt4GB) * KV_CACHE_USABLE_VRAM_FRACTION * 1024 ** 3;
+  const kvBytesPerSequence = approxKvCacheBytesPerToken(model) * avgContextTokens;
+  return Math.max(1, Math.floor(kvHeadroomBytes / kvBytesPerSequence));
+}
+
 /**
  * Returns a copy of the workload representing a proportional share of it
  * (a smart-routing tier, or one compliance region): its own document count,
@@ -248,12 +275,24 @@ export function calculateSelfHostCost(
   // can't add half a cluster to a model that needs 8 GPUs just to load.
   const replicasVolume = Math.ceil(requiredThroughputTokPerSec / plannedReplicaThroughput);
   const peakConcurrentUsers = isInteractive ? capacity.peakConcurrentUsers : 0;
-  const replicasConcurrency = isInteractive
-    ? Math.ceil(
-        peakConcurrentUsers /
-          Math.max(1, Math.floor(plannedReplicaThroughput / capacity.targetTokPerSecPerUser)),
-      )
-    : 0;
+  // Users one replica can serve is capped by BOTH raw compute (tok/s split
+  // across users at the target per-user speed) AND spare VRAM for each
+  // in-flight conversation's KV cache - whichever is tighter wins.
+  let replicasConcurrency = 0;
+  let tighterConcurrencyBound: SelfHostConcurrencyBound | undefined;
+  if (isInteractive) {
+    const throughputBoundConcurrency = Math.floor(
+      plannedReplicaThroughput / capacity.targetTokPerSecPerUser,
+    );
+    const vramBoundConcurrency = maxConcurrentSequencesFromVram(model, gpuType, model.minGpuCount);
+    const maxConcurrentPerReplica = Math.max(
+      1,
+      Math.min(throughputBoundConcurrency, vramBoundConcurrency),
+    );
+    replicasConcurrency = Math.ceil(peakConcurrentUsers / maxConcurrentPerReplica);
+    tighterConcurrencyBound =
+      vramBoundConcurrency < throughputBoundConcurrency ? "vram" : "throughput";
+  }
   const replicas = Math.max(1, replicasVolume, replicasConcurrency);
   const gpusNeeded = replicas * model.minGpuCount;
 
@@ -263,6 +302,7 @@ export function calculateSelfHostCost(
       : replicasConcurrency > replicasVolume
         ? "concurrency"
         : "volume";
+  const concurrencyBound = limitingFactor === "concurrency" ? tighterConcurrencyBound : undefined;
 
   const utilizationPct = Math.min(
     100,
@@ -271,6 +311,7 @@ export function calculateSelfHostCost(
 
   let computeCostMonthly = 0;
   let electricityCostMonthly = 0;
+  let hardwareCostOneTimeUsd = 0;
   let billedHoursPerMonth: number;
 
   if (hostParams.kind === "cloud") {
@@ -288,6 +329,9 @@ export function calculateSelfHostCost(
   } else {
     const hardwareCostTotal =
       gpusNeeded * hostParams.ownedGpu.approxUnitCostUsd * OWN_SERVER_DEFAULTS.serverOverheadMultiplier;
+    // The actual upfront check, kept separately from its amortized slice so
+    // the UI can show capex vs. ongoing opex distinctly.
+    hardwareCostOneTimeUsd = hardwareCostTotal;
     const monthlyDepreciation = hardwareCostTotal / (hostParams.depreciationYears * 12);
     computeCostMonthly = monthlyDepreciation;
 
@@ -301,6 +345,10 @@ export function calculateSelfHostCost(
     (computeCostMonthly + electricityCostMonthly) * hostParams.opsOverheadPct;
 
   const totalMonthlyCost = computeCostMonthly + electricityCostMonthly + overheadCostMonthly;
+  // Cloud rental is fully recurring (no capex to strip out); owned hardware's
+  // recurring burn excludes the amortized depreciation slice.
+  const recurringMonthlyCostExclHardware =
+    totalMonthlyCost - (hostParams.kind === "owned" ? computeCostMonthly : 0);
 
   return {
     modelId: model.id,
@@ -309,6 +357,7 @@ export function calculateSelfHostCost(
     replicas,
     gpusNeeded,
     limitingFactor,
+    ...(concurrencyBound ? { concurrencyBound } : {}),
     servingPattern: capacity.pattern,
     peakConcurrentUsers,
     activeHoursPerMonth,
@@ -319,6 +368,8 @@ export function calculateSelfHostCost(
     electricityCostMonthly,
     overheadCostMonthly,
     totalMonthlyCost,
+    hardwareCostOneTimeUsd,
+    recurringMonthlyCostExclHardware,
     costPerDocument: workload.docsPerMonth > 0 ? totalMonthlyCost / workload.docsPerMonth : 0,
     annualCost: totalMonthlyCost * 12,
   };
@@ -388,26 +439,23 @@ export function calculateRoutedApiCost(
 }
 
 /**
- * Quick, comparable cost estimate for an open-source model using its own
- * recommended GPU (preferring AWS on-demand pricing, falling back to
- * whichever cloud lists that GPU type) at default ops overhead. Used to show
- * a cost preview on the open-source catalog cards, the same way the
- * commercial catalog shows a live price per card.
+ * Monthly cost estimate for an open-source model under a given, already
+ * resolved hosting setup. Used for the open-source catalog card previews and
+ * the routing-tier guardrails. Callers resolve hostParams from the user's
+ * actual hosting settings (see hostParamsForModel in page.tsx) so these
+ * previews match the rest of the app - e.g. the routing panel's baseline -
+ * instead of assuming a fixed provider/pricing mode.
  */
-export function estimateSelfHostMonthlyCost(workload: WorkloadInputs, model: OpenSourceModel): number {
-  const candidates = GPU_INSTANCES.filter((i) => i.gpuType === model.minGpuType);
-  const instance =
-    candidates.find((i) => i.cloud === "AWS") ?? candidates[0] ?? GPU_INSTANCES[0];
-
-  const breakdown = calculateSelfHostCost(workload, model, {
-    kind: "cloud",
-    gpuInstance: instance,
-    useReservedPricing: false,
-    opsOverheadPct: CLOUD_OPS_OVERHEAD_DEFAULT_PCT,
-  });
-
-  return breakdown.totalMonthlyCost;
+export function estimateSelfHostMonthlyCost(
+  workload: WorkloadInputs,
+  model: OpenSourceModel,
+  hostParams: HostParams,
+): number {
+  return calculateSelfHostCost(workload, model, hostParams).totalMonthlyCost;
 }
+
+/** Resolves the hosting setup to price a given open-source model under. */
+export type ResolveHostParams = (model: OpenSourceModel) => HostParams;
 
 /**
  * Whether a single model call's input would exceed (or come close to) a
@@ -447,17 +495,24 @@ export function getModelsCheaperThan(
 /**
  * Same structural guardrail as getModelsCheaperThan, but for self-hosted
  * open-source models: only a model that is genuinely cheaper to self-host
- * (on its own recommended GPU) than the reference model is offered as a
- * cheaper routing tier.
+ * (on the hosting each model resolves to via resolveHostParams) than the
+ * reference model is offered as a cheaper routing tier.
  */
 export function getOpenSourceModelsCheaperThan(
   workload: WorkloadInputs,
   models: OpenSourceModel[],
   referenceModel: OpenSourceModel,
+  resolveHostParams: ResolveHostParams,
 ): OpenSourceModel[] {
-  const referenceCost = estimateSelfHostMonthlyCost(workload, referenceModel);
+  const referenceCost = estimateSelfHostMonthlyCost(
+    workload,
+    referenceModel,
+    resolveHostParams(referenceModel),
+  );
   return models.filter(
-    (m) => m.id !== referenceModel.id && estimateSelfHostMonthlyCost(workload, m) < referenceCost,
+    (m) =>
+      m.id !== referenceModel.id &&
+      estimateSelfHostMonthlyCost(workload, m, resolveHostParams(m)) < referenceCost,
   );
 }
 
@@ -654,6 +709,10 @@ export function scaleSelfHostBreakdown(
   const electricityCostMonthly = breakdown.electricityCostMonthly * multiplier;
   const overheadCostMonthly = breakdown.overheadCostMonthly * multiplier;
   const totalMonthlyCost = computeCostMonthly + electricityCostMonthly + overheadCostMonthly;
+  // Both new cost fields are linear in the same components, so they scale by
+  // the same regional multiplier.
+  const hardwareCostOneTimeUsd = breakdown.hardwareCostOneTimeUsd * multiplier;
+  const recurringMonthlyCostExclHardware = breakdown.recurringMonthlyCostExclHardware * multiplier;
 
   return {
     ...breakdown,
@@ -661,6 +720,8 @@ export function scaleSelfHostBreakdown(
     electricityCostMonthly,
     overheadCostMonthly,
     totalMonthlyCost,
+    hardwareCostOneTimeUsd,
+    recurringMonthlyCostExclHardware,
     costPerDocument: regionalDocsPerMonth > 0 ? totalMonthlyCost / regionalDocsPerMonth : 0,
     annualCost: totalMonthlyCost * 12,
   };
@@ -675,6 +736,18 @@ function combineLimitingFactors(factors: SelfHostLimitingFactor[]): SelfHostLimi
   if (factors.includes("concurrency")) return "concurrency";
   if (factors.includes("volume")) return "volume";
   return "minimum-footprint";
+}
+
+/**
+ * Across regions, GPU memory is reported as the concurrency bound if it
+ * bound any concurrency-limited region (it changes what the user should do).
+ */
+function combineConcurrencyBounds(
+  bounds: (SelfHostConcurrencyBound | undefined)[],
+): SelfHostConcurrencyBound | undefined {
+  if (bounds.includes("vram")) return "vram";
+  if (bounds.includes("throughput")) return "throughput";
+  return undefined;
 }
 
 function totalDocsOf(allocations: RegionAllocation<unknown>[]): number {
@@ -747,6 +820,13 @@ export function aggregateSelfHostBreakdowns(
   const electricityCostMonthly = sum((b) => b.electricityCostMonthly);
   const overheadCostMonthly = sum((b) => b.overheadCostMonthly);
   const totalMonthlyCost = computeCostMonthly + electricityCostMonthly + overheadCostMonthly;
+  const hardwareCostOneTimeUsd = sum((b) => b.hardwareCostOneTimeUsd);
+  const recurringMonthlyCostExclHardware = sum((b) => b.recurringMonthlyCostExclHardware);
+  const limitingFactor = combineLimitingFactors(allocations.map((a) => a.breakdown.limitingFactor));
+  const concurrencyBound =
+    limitingFactor === "concurrency"
+      ? combineConcurrencyBounds(allocations.map((a) => a.breakdown.concurrencyBound))
+      : undefined;
   const requiredThroughputTokPerSec = sum((b) => b.requiredThroughputTokPerSec);
   // gpuThroughputTokPerSec is per replica, so total capacity is replicas x that.
   const totalCapacityTokPerSec = allocations.reduce(
@@ -761,7 +841,8 @@ export function aggregateSelfHostBreakdowns(
     gpuThroughputTokPerSec: first?.gpuThroughputTokPerSec ?? 0,
     replicas: sum((b) => b.replicas),
     gpusNeeded: sum((b) => b.gpusNeeded),
-    limitingFactor: combineLimitingFactors(allocations.map((a) => a.breakdown.limitingFactor)),
+    limitingFactor,
+    ...(concurrencyBound ? { concurrencyBound } : {}),
     servingPattern: first?.servingPattern ?? "batch",
     peakConcurrentUsers: sum((b) => b.peakConcurrentUsers),
     activeHoursPerMonth: first?.activeHoursPerMonth ?? 0,
@@ -775,6 +856,8 @@ export function aggregateSelfHostBreakdowns(
     electricityCostMonthly,
     overheadCostMonthly,
     totalMonthlyCost,
+    hardwareCostOneTimeUsd,
+    recurringMonthlyCostExclHardware,
     costPerDocument: totalDocs > 0 ? totalMonthlyCost / totalDocs : 0,
     annualCost: totalMonthlyCost * 12,
   };

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CalculatorHeader } from "@/components/calculator/header";
 import { WorkloadPanel } from "@/components/calculator/workload-panel";
@@ -172,6 +172,41 @@ export default function Home() {
 
   const layaRouter = ROUTER_OPTIONS.find((r) => r.id === "laya")!;
 
+  const selectedGpuInstance = GPU_INSTANCES.find((i) => i.id === hostConfig.gpuInstanceId)!;
+
+  // Derives hosting for any open-source model (a routing tier, or a catalog
+  // card preview) using the same cloud/pricing settings as the main
+  // HostingSelector, but matched to that model's own recommended GPU type
+  // rather than the main model's. Sharing this one resolver keeps catalog
+  // previews, routing guardrails and the routing baseline consistent.
+  const hostParamsForModel = useCallback(
+    (model: (typeof OPEN_SOURCE_MODELS)[number]): HostParams => {
+      if (hostConfig.location === "cloud") {
+        const match = GPU_INSTANCES.find(
+          (i) => i.cloud === hostConfig.cloudProvider && i.gpuType === model.minGpuType,
+        );
+        const fallback = GPU_INSTANCES.find((i) => i.gpuType === model.minGpuType) ?? selectedGpuInstance;
+        return {
+          kind: "cloud",
+          gpuInstance: match ?? fallback,
+          useReservedPricing: hostConfig.useReservedPricing,
+          scaleDownOutsideActiveHours: hostConfig.scaleDownOutsideActiveHours,
+          opsOverheadPct: hostConfig.opsOverheadPct,
+        };
+      }
+      const ownedSpec =
+        OWNED_GPU_SPECS.find((s) => s.gpuType === model.minGpuType) ??
+        OWNED_GPU_SPECS.find((s) => s.gpuType === hostConfig.ownedGpuType)!;
+      return {
+        kind: "owned",
+        ownedGpu: ownedSpec,
+        opsOverheadPct: hostConfig.opsOverheadPct,
+        depreciationYears: hostConfig.depreciationYears,
+      };
+    },
+    [hostConfig, selectedGpuInstance],
+  );
+
   // Structural guardrail: if the main model changes such that the current
   // Low/Medium routing tier is no longer cheaper than it, auto-correct to a
   // valid selection instead of silently allowing routing to cost more.
@@ -211,8 +246,14 @@ export default function Home() {
   // models genuinely cheaper to self-host than the selected "High" model are
   // valid Low/Medium tiers.
   const cheaperOssThanHigh = useMemo(
-    () => getOpenSourceModelsCheaperThan(workload, OPEN_SOURCE_MODELS, selectedOpenSourceModel),
-    [workload, selectedOpenSourceModel],
+    () =>
+      getOpenSourceModelsCheaperThan(
+        workload,
+        OPEN_SOURCE_MODELS,
+        selectedOpenSourceModel,
+        hostParamsForModel,
+      ),
+    [workload, selectedOpenSourceModel, hostParamsForModel],
   );
   const cheaperOssKey = cheaperOssThanHigh
     .map((m) => m.id)
@@ -228,7 +269,9 @@ export default function Home() {
       }
     } else {
       const cheapestId = [...cheaperOssThanHigh].sort(
-        (a, b) => estimateSelfHostMonthlyCost(workload, a) - estimateSelfHostMonthlyCost(workload, b),
+        (a, b) =>
+          estimateSelfHostMonthlyCost(workload, a, hostParamsForModel(a)) -
+          estimateSelfHostMonthlyCost(workload, b, hostParamsForModel(b)),
       )[0].id;
       let next = selfHostRoutingConfig;
       if (!cheaperOssThanHigh.some((m) => m.id === next.smallModelId)) {
@@ -315,8 +358,6 @@ export default function Home() {
     [routedAllocations],
   );
 
-  const selectedGpuInstance = GPU_INSTANCES.find((i) => i.id === hostConfig.gpuInstanceId)!;
-
   const hostParams: HostParams = useMemo(() => {
     if (hostConfig.location === "cloud") {
       return {
@@ -359,34 +400,6 @@ export default function Home() {
     [selfHostAllocations],
   );
 
-  // Derives hosting for a routing tier's model using the same cloud/pricing
-  // settings as the main HostingSelector, but matched to that tier's own
-  // recommended GPU type rather than the main model's.
-  function hostParamsForModel(model: (typeof OPEN_SOURCE_MODELS)[number]): HostParams {
-    if (hostConfig.location === "cloud") {
-      const match = GPU_INSTANCES.find(
-        (i) => i.cloud === hostConfig.cloudProvider && i.gpuType === model.minGpuType,
-      );
-      const fallback = GPU_INSTANCES.find((i) => i.gpuType === model.minGpuType) ?? selectedGpuInstance;
-      return {
-        kind: "cloud",
-        gpuInstance: match ?? fallback,
-        useReservedPricing: hostConfig.useReservedPricing,
-        scaleDownOutsideActiveHours: hostConfig.scaleDownOutsideActiveHours,
-        opsOverheadPct: hostConfig.opsOverheadPct,
-      };
-    }
-    const ownedSpec =
-      OWNED_GPU_SPECS.find((s) => s.gpuType === model.minGpuType) ??
-      OWNED_GPU_SPECS.find((s) => s.gpuType === hostConfig.ownedGpuType)!;
-    return {
-      kind: "owned",
-      ownedGpu: ownedSpec,
-      opsOverheadPct: hostConfig.opsOverheadPct,
-      depreciationYears: hostConfig.depreciationYears,
-    };
-  }
-
   const selfHostRoutedAllocations = useMemo<RegionAllocation<ReturnType<typeof calculateRoutedSelfHostCost>>[]>(
     () =>
       selectedRegions.map((regionId, i) => {
@@ -413,7 +426,6 @@ export default function Home() {
         const breakdown = scaleRoutedSelfHostBreakdown(base, multiplier, docsPerMonth);
         return { regionId, docsPerMonth, breakdown };
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- hostParamsForModel closes over hostConfig, already a dep
     [
       selectedRegions,
       regionDocsSplit,
@@ -424,7 +436,7 @@ export default function Home() {
       layaRouter,
       selfHostRoutingConfig.escalationRatePct,
       selfHostRoutingConfig.mediumRatePct,
-      hostConfig,
+      hostParamsForModel,
     ],
   );
 
@@ -493,6 +505,7 @@ export default function Home() {
                 workload={workload}
                 selectedId={selectedOpenSourceModel.id}
                 onSelect={setSelectedOpenSourceId}
+                hostParamsForModel={hostParamsForModel}
               />
               <HostingSelector
                 config={hostConfig}
@@ -506,6 +519,7 @@ export default function Home() {
                 models={OPEN_SOURCE_MODELS}
                 workload={workload}
                 highModel={selectedOpenSourceModel}
+                hostParamsForModel={hostParamsForModel}
               />
             </div>
             <div className="lg:col-span-1">
@@ -515,6 +529,7 @@ export default function Home() {
                   mediumModel={selectedSelfHostMediumModel}
                   lowModel={selectedSelfHostSmallModel}
                   isOwned={hostConfig.location === "owned"}
+                  depreciationYears={hostConfig.depreciationYears}
                   breakdown={selfHostRoutedBreakdown}
                   regionalBreakdowns={regionalSelfHostRoutedRows}
                 />
@@ -523,6 +538,7 @@ export default function Home() {
                   model={selectedOpenSourceModel}
                   breakdown={selfHostBreakdown}
                   isOwned={hostConfig.location === "owned"}
+                  depreciationYears={hostConfig.depreciationYears}
                   locationLabel={
                     hostConfig.location === "cloud"
                       ? `${hostConfig.cloudProvider} (${selectedGpuInstance.gpuType})`

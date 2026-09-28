@@ -13,7 +13,11 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { getOpenSourceModelsCheaperThan, estimateSelfHostMonthlyCost } from "@/lib/calculations";
+import {
+  getOpenSourceModelsCheaperThan,
+  estimateSelfHostMonthlyCost,
+  type ResolveHostParams,
+} from "@/lib/calculations";
 import { formatUsd } from "@/lib/format";
 import type { OpenSourceModel, RoutingConfig, WorkloadInputs } from "@/lib/types";
 import { AlertTriangle, Info, Route } from "lucide-react";
@@ -26,6 +30,9 @@ interface SelfHostRoutingPanelProps {
   models: OpenSourceModel[];
   workload: WorkloadInputs;
   highModel: OpenSourceModel;
+  // Same per-model hosting resolver the routing breakdown uses, so the
+  // guardrail and previews here match the routed costs.
+  hostParamsForModel: ResolveHostParams;
 }
 
 export function SelfHostRoutingPanel({
@@ -34,16 +41,19 @@ export function SelfHostRoutingPanel({
   models,
   workload,
   highModel,
+  hostParamsForModel,
 }: SelfHostRoutingPanelProps) {
   // Structural guardrail: only open-source models genuinely cheaper to
-  // self-host than the selected "High" model, for this exact workload, are
-  // offered as Low/Medium tiers.
+  // self-host than the selected "High" model, for this exact workload and
+  // hosting setup, are offered as Low/Medium tiers.
   const cheaperModels = useMemo(
     () =>
-      getOpenSourceModelsCheaperThan(workload, models, highModel).sort(
-        (a, b) => estimateSelfHostMonthlyCost(workload, a) - estimateSelfHostMonthlyCost(workload, b),
+      getOpenSourceModelsCheaperThan(workload, models, highModel, hostParamsForModel).sort(
+        (a, b) =>
+          estimateSelfHostMonthlyCost(workload, a, hostParamsForModel(a)) -
+          estimateSelfHostMonthlyCost(workload, b, hostParamsForModel(b)),
       ),
-    [workload, models, highModel],
+    [workload, models, highModel, hostParamsForModel],
   );
 
   const highPct = Math.round(config.escalationRatePct * 100);
@@ -215,7 +225,10 @@ export function SelfHostRoutingPanel({
               {lowModel && (
                 <p className="text-xs text-muted-foreground">
                   {lowModel.recommendedGpuLabel} - roughly{" "}
-                  {formatUsd(estimateSelfHostMonthlyCost(workload, lowModel))}/mo if it handled all
+                  {formatUsd(
+                    estimateSelfHostMonthlyCost(workload, lowModel, hostParamsForModel(lowModel)),
+                  )}
+                  /mo if it handled all
                   your volume alone - handles the {lowPct}% of requests that aren&apos;t escalated.
                 </p>
               )}

@@ -103,3 +103,26 @@ export const BATCH_API_PRICE_MULTIPLIER = 0.5;
 // Cloud scale-down mode: extra billed time per active day for spinning
 // instances up and loading model weights (30 min/active day).
 export const SCALE_DOWN_SPINUP_HOURS_PER_ACTIVE_DAY = 0.5;
+
+// Rough order-of-magnitude KV-cache size per token, per billion (active)
+// params, fp16 KV cache. Calibrated directly to the published Llama-3.1 70B
+// figure (~0.3MB/token / 70B =~ 0.0043) rather than averaged with the much
+// smaller Llama-3 8B figure (~0.1MB/token / 8B =~ 0.0125), because this
+// catalog's "live users" / interactive scenarios are dominated by 20B-120B
+// models - a constant tuned to the 8B end would understate KV-cache pressure
+// for exactly the model sizes this warning matters most for. This is a
+// coarse approximation either way - actual KV-cache size depends on
+// num_layers/num_kv_heads/head_dim, not just param count, and can vary 2-3x
+// by architecture family - so it understates the true figure for small
+// (7-14B) models, which mostly appear here in high-volume batch/extraction
+// roles rather than concurrency-heavy interactive ones.
+export const KV_CACHE_MB_PER_TOKEN_PER_B_PARAMS = 0.0043;
+
+// Fraction of post-weights VRAM headroom assumed usable for KV-cache blocks
+// (the rest covers activations, CUDA context, and framework overhead).
+export const KV_CACHE_USABLE_VRAM_FRACTION = 0.85;
+
+// Default assumed context length per concurrent interactive session, for
+// capacity planning purposes (this app doesn't collect a per-workload average
+// context length input). Chosen as a mid-range interactive/chat assumption.
+export const ASSUMED_AVG_CONTEXT_TOKENS_PER_CONCURRENT_USER = 4096;

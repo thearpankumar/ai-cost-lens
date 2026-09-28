@@ -145,6 +145,11 @@ export interface ApiCostBreakdown {
 // Which bound produced the final replica count.
 export type SelfHostLimitingFactor = "minimum-footprint" | "volume" | "concurrency";
 
+// For concurrency-limited interactive deployments: whether raw compute
+// throughput or GPU memory (KV cache for in-flight conversations) capped how
+// many users one replica can serve.
+export type SelfHostConcurrencyBound = "throughput" | "vram";
+
 export interface SelfHostCostBreakdown {
   modelId: string;
   requiredThroughputTokPerSec: number; // during active hours
@@ -152,6 +157,9 @@ export interface SelfHostCostBreakdown {
   replicas: number; // independent copies of the model being served
   gpusNeeded: number; // replicas * model.minGpuCount
   limitingFactor: SelfHostLimitingFactor;
+  // Set only when limitingFactor === "concurrency" (interactive pattern):
+  // which per-replica bound was tighter. Omitted for batch / volume-bound.
+  concurrencyBound?: SelfHostConcurrencyBound;
   servingPattern: ServingPattern;
   peakConcurrentUsers: number; // concurrency this deployment was sized for (0 for batch)
   activeHoursPerMonth: number;
@@ -161,7 +169,16 @@ export interface SelfHostCostBreakdown {
   computeCostMonthly: number; // GPU rental or amortized hardware
   electricityCostMonthly: number; // 0 for cloud rental
   overheadCostMonthly: number; // ops/maintenance
+  // Apples-to-apples monthly figure (owned hardware amortized straight-line),
+  // comparable against cloud rental and API pricing.
   totalMonthlyCost: number;
+  // Owned hardware only: the raw, un-amortized upfront purchase (GPUs plus
+  // server overhead). 0 for cloud rental, which has no capex.
+  hardwareCostOneTimeUsd: number;
+  // What genuinely recurs every month once any hardware is paid for:
+  // totalMonthlyCost minus the amortized hardware slice for owned hardware;
+  // equal to totalMonthlyCost for cloud rental.
+  recurringMonthlyCostExclHardware: number;
   costPerDocument: number;
   annualCost: number;
 }

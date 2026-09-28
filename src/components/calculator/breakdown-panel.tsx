@@ -14,7 +14,7 @@ import type {
   RoutedSelfHostCostBreakdown,
   SelfHostCostBreakdown,
 } from "@/lib/types";
-import { AlertTriangle, TrendingDown } from "lucide-react";
+import { AlertTriangle, Info, TrendingDown } from "lucide-react";
 import { RegionalCostList, type RegionalCostRow } from "@/components/calculator/regional-cost-list";
 
 interface LineItemProps {
@@ -59,14 +59,73 @@ function VramHeadroomNotice({ modelName }: { modelName?: string }) {
 /** Plain-English "why this many GPUs" explanation for a self-host breakdown. */
 export function describeLimitingFactor(breakdown: SelfHostCostBreakdown): string {
   switch (breakdown.limitingFactor) {
-    case "concurrency":
-      return `sized to comfortably handle ${formatNumber(Math.ceil(breakdown.peakConcurrentUsers))} people at once`;
+    case "concurrency": {
+      const people = formatNumber(Math.ceil(breakdown.peakConcurrentUsers));
+      return breakdown.concurrencyBound === "vram"
+        ? `sized to handle ${people} people at once - limited by GPU memory for concurrent conversations, not raw speed`
+        : `sized to comfortably handle ${people} people at once`;
+    }
     case "volume":
       return "sized for your document volume";
     default:
       return "minimum footprint for this model";
   }
 }
+
+const VRAM_BOUND_CONCURRENCY_MESSAGE =
+  "Each live conversation needs its own slice of GPU memory (its KV cache, assumed ~4K tokens of context per person). Here that memory - not raw GPU speed - caps how many people one server can serve at once, so capacity grows by adding GPUs or choosing GPUs with more memory; a faster card with the same memory won't help much.";
+
+function VramBoundConcurrencyNotice() {
+  return (
+    <div className="flex items-start gap-2 rounded-md border bg-muted/40 p-3">
+      <Info className="h-4 w-4 shrink-0 text-muted-foreground mt-0.5" />
+      <p className="text-xs text-muted-foreground">
+        <span className="font-medium text-foreground">Limited by GPU memory: </span>
+        {VRAM_BOUND_CONCURRENCY_MESSAGE}
+      </p>
+    </div>
+  );
+}
+
+function yearsLabel(years: number): string {
+  return `${years} year${years === 1 ? "" : "s"}`;
+}
+
+/**
+ * Owned hardware: shows the one-time purchase separately from what keeps
+ * recurring every month, so capex isn't blurred into the monthly figure.
+ */
+function OwnedHardwareCostSplit({
+  oneTimeUsd,
+  recurringMonthly,
+  gpusNeeded,
+  recurringSub,
+}: {
+  oneTimeUsd: number;
+  recurringMonthly: number;
+  gpusNeeded: number;
+  recurringSub: string;
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+      <div className="rounded-md border border-primary/30 bg-primary/5 p-3">
+        <p className="text-xs text-muted-foreground">Hardware purchase (one-time)</p>
+        <p className="text-lg font-semibold tabular-nums">{formatUsd(oneTimeUsd)}</p>
+        <p className="text-xs text-muted-foreground">
+          {gpusNeeded} GPU{gpusNeeded > 1 ? "s" : ""} plus server, paid upfront
+        </p>
+      </div>
+      <div className="rounded-md bg-muted/60 p-3">
+        <p className="text-xs text-muted-foreground">Ongoing cost per month</p>
+        <p className="text-lg font-semibold tabular-nums">{formatUsd(recurringMonthly)}</p>
+        <p className="text-xs text-muted-foreground">{recurringSub}</p>
+      </div>
+    </div>
+  );
+}
+
+const OWNED_FINANCING_CAVEAT =
+  "Owned-hardware figures assume an upfront cash purchase with straight-line depreciation; financing or leasing costs are not modeled, so financed or leased hardware would cost more per month than shown.";
 
 function gpuCountLabel(breakdown: SelfHostCostBreakdown): string {
   const gpus = `${breakdown.gpusNeeded} GPU${breakdown.gpusNeeded > 1 ? "s" : ""}`;
@@ -287,16 +346,20 @@ export function SelfHostBreakdownPanel({
   breakdown,
   locationLabel,
   isOwned,
+  depreciationYears,
   regionalBreakdowns,
 }: {
   model: OpenSourceModel;
   breakdown: SelfHostCostBreakdown;
   locationLabel: string;
   isOwned: boolean;
+  depreciationYears: number;
   regionalBreakdowns?: RegionalCostRow[];
 }) {
   const multiRegion = (regionalBreakdowns?.length ?? 1) > 1;
   const lowUtilization = multiRegion && breakdown.utilizationPct < 30;
+  const vramBound =
+    breakdown.limitingFactor === "concurrency" && breakdown.concurrencyBound === "vram";
 
   return (
     <Card className="sticky top-4">
@@ -313,7 +376,23 @@ export function SelfHostBreakdownPanel({
         <div>
           <p className="text-3xl font-bold tabular-nums">{formatUsd(breakdown.totalMonthlyCost)}</p>
           <p className="text-sm text-muted-foreground">per month</p>
+          {isOwned && (
+            <p className="text-xs text-muted-foreground mt-1">
+              Comparison figure - includes {formatUsd(breakdown.computeCostMonthly)}/mo of
+              hardware spread over {yearsLabel(depreciationYears)}. See the one-time purchase
+              below.
+            </p>
+          )}
         </div>
+
+        {isOwned && (
+          <OwnedHardwareCostSplit
+            oneTimeUsd={breakdown.hardwareCostOneTimeUsd}
+            recurringMonthly={breakdown.recurringMonthlyCostExclHardware}
+            gpusNeeded={breakdown.gpusNeeded}
+            recurringSub="electricity + ops, once the hardware is paid for"
+          />
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <div className="rounded-md bg-muted/60 p-3">
@@ -348,6 +427,8 @@ export function SelfHostBreakdownPanel({
 
         {breakdown.vramHeadroomWarning && <VramHeadroomNotice />}
 
+        {vramBound && <VramBoundConcurrencyNotice />}
+
         {lowUtilization && (
           <WarningBanner>
             <span className="font-semibold">Utilization is only {breakdown.utilizationPct.toFixed(0)}%</span>{" "}
@@ -360,30 +441,50 @@ export function SelfHostBreakdownPanel({
         <Separator />
 
         <div>
-          <LineItem
-            label={isOwned ? "Hardware (amortized)" : "GPU rental"}
-            sub={
-              isOwned
-                ? `${breakdown.gpusNeeded} GPU${breakdown.gpusNeeded > 1 ? "s" : ""}`
-                : `${breakdown.gpusNeeded} GPU${breakdown.gpusNeeded > 1 ? "s" : ""} x ~${formatNumber(Math.round(breakdown.billedHoursPerMonth))} h/month`
-            }
-            value={formatUsd(breakdown.computeCostMonthly)}
-          />
-          {isOwned && (
-            <LineItem
-              label="Electricity"
-              sub={`~${formatNumber(Math.round(breakdown.billedHoursPerMonth))} powered hours/month`}
-              value={formatUsd(breakdown.electricityCostMonthly)}
-            />
+          {isOwned ? (
+            <>
+              <LineItem
+                label="Electricity"
+                sub={`~${formatNumber(Math.round(breakdown.billedHoursPerMonth))} powered hours/month`}
+                value={formatUsd(breakdown.electricityCostMonthly)}
+              />
+              <LineItem label="Ops & maintenance" value={formatUsd(breakdown.overheadCostMonthly)} />
+              <Separator className="my-2" />
+              <LineItem
+                label="Ongoing monthly cost"
+                sub="what keeps recurring once the hardware is paid for"
+                value={formatUsd(breakdown.recurringMonthlyCostExclHardware)}
+              />
+              <LineItem
+                label="Hardware, amortized"
+                sub={`${formatUsd(breakdown.hardwareCostOneTimeUsd)} one-time purchase spread over ${yearsLabel(depreciationYears)}`}
+                value={formatUsd(breakdown.computeCostMonthly)}
+              />
+              <Separator className="my-2" />
+              <LineItem
+                label="Total (comparison figure)"
+                sub="ongoing cost + amortized hardware"
+                value={formatUsd(breakdown.totalMonthlyCost)}
+              />
+            </>
+          ) : (
+            <>
+              <LineItem
+                label="GPU rental"
+                sub={`${breakdown.gpusNeeded} GPU${breakdown.gpusNeeded > 1 ? "s" : ""} x ~${formatNumber(Math.round(breakdown.billedHoursPerMonth))} h/month`}
+                value={formatUsd(breakdown.computeCostMonthly)}
+              />
+              <LineItem label="Ops & maintenance" value={formatUsd(breakdown.overheadCostMonthly)} />
+              <Separator className="my-2" />
+              <LineItem label="Total" value={formatUsd(breakdown.totalMonthlyCost)} />
+            </>
           )}
-          <LineItem label="Ops & maintenance" value={formatUsd(breakdown.overheadCostMonthly)} />
-          <Separator className="my-2" />
-          <LineItem label="Total" value={formatUsd(breakdown.totalMonthlyCost)} />
         </div>
 
         <p className="text-xs text-muted-foreground pt-2 border-t">
           Estimate based on public cloud list pricing and typical hardware/ops assumptions.
           Actual cost depends on region, negotiated discounts and real-world utilization.
+          {isOwned && ` ${OWNED_FINANCING_CAVEAT}`}
         </p>
       </CardContent>
     </Card>
@@ -401,6 +502,7 @@ export function RoutedSelfHostBreakdownPanel({
   mediumModel,
   lowModel,
   isOwned,
+  depreciationYears,
   breakdown,
   regionalBreakdowns,
 }: {
@@ -408,9 +510,27 @@ export function RoutedSelfHostBreakdownPanel({
   mediumModel?: OpenSourceModel | null;
   lowModel: OpenSourceModel;
   isOwned: boolean;
+  depreciationYears: number;
   breakdown: RoutedSelfHostCostBreakdown;
   regionalBreakdowns?: RegionalCostRow[];
 }) {
+  // Owned hardware: the upfront purchase across every tier (and region), kept
+  // separate from what recurs monthly - each tier's ongoing cost plus the
+  // router, which is a recurring fee.
+  const hardwareOneTimeUsd = breakdown.tiers.reduce(
+    (sum, t) => sum + t.breakdown.hardwareCostOneTimeUsd,
+    0,
+  );
+  const amortizedHardwareMonthly = breakdown.tiers.reduce(
+    (sum, t) => sum + t.breakdown.computeCostMonthly,
+    0,
+  );
+  const recurringMonthly =
+    breakdown.tiers.reduce((sum, t) => sum + t.breakdown.recurringMonthlyCostExclHardware, 0) +
+    breakdown.routerCost;
+  const anyTierVramBound = breakdown.tiers.some(
+    (t) => t.breakdown.limitingFactor === "concurrency" && t.breakdown.concurrencyBound === "vram",
+  );
   const modelsByTier: Record<"high" | "medium" | "low", OpenSourceModel | null | undefined> = {
     high: highModel,
     medium: mediumModel,
@@ -443,7 +563,22 @@ export function RoutedSelfHostBreakdownPanel({
         <div>
           <p className="text-3xl font-bold tabular-nums">{formatUsd(breakdown.totalMonthlyCost)}</p>
           <p className="text-sm text-muted-foreground">per month</p>
+          {isOwned && (
+            <p className="text-xs text-muted-foreground mt-1">
+              Comparison figure - includes {formatUsd(amortizedHardwareMonthly)}/mo of hardware
+              spread over {yearsLabel(depreciationYears)}. See the one-time purchase below.
+            </p>
+          )}
         </div>
+
+        {isOwned && (
+          <OwnedHardwareCostSplit
+            oneTimeUsd={hardwareOneTimeUsd}
+            recurringMonthly={recurringMonthly}
+            gpusNeeded={breakdown.totalGpusNeeded}
+            recurringSub="electricity, ops and router, once the hardware is paid for"
+          />
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <div className="rounded-md bg-muted/60 p-3">
@@ -481,6 +616,8 @@ export function RoutedSelfHostBreakdownPanel({
 
         {vramTightModels.length > 0 && <VramHeadroomNotice modelName={vramTightModels.join(", ")} />}
 
+        {anyTierVramBound && <VramBoundConcurrencyNotice />}
+
         {regionalBreakdowns && <RegionalCostList rows={regionalBreakdowns} />}
 
         <Separator />
@@ -501,13 +638,18 @@ export function RoutedSelfHostBreakdownPanel({
           })}
           <LineItem label="Router (Laya)" value={formatUsd(breakdown.routerCost)} />
           <Separator className="my-2" />
-          <LineItem label="Total" value={formatUsd(breakdown.totalMonthlyCost)} />
+          <LineItem
+            label={isOwned ? "Total (comparison figure)" : "Total"}
+            sub={isOwned ? "ongoing cost + amortized hardware" : undefined}
+            value={formatUsd(breakdown.totalMonthlyCost)}
+          />
         </div>
 
         <p className="text-xs text-muted-foreground pt-2 border-t">
           Each tier is priced as {isOwned ? "amortized owned hardware" : "its own GPU rental"} sized
           to its share of volume. Escalation rate is a planning assumption - your actual
           complex-vs-simple split will vary by workload.
+          {isOwned && ` ${OWNED_FINANCING_CAVEAT}`}
         </p>
       </CardContent>
     </Card>

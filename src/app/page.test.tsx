@@ -150,18 +150,57 @@ describe("Home (calculator page)", () => {
 
     // Default hosting is AWS, which has no A100-80GB, so it falls back to AWS's most
     // capable option (H100-80GB, p5.48xlarge). Llama 3.3 70B: 600 tok/s * (2.88 / 1.0)
-    // = 1,728 tok/s per replica; one replica serves floor(1728 * 0.8 / 20) = 69 users
-    // -> ceil(200 / 69) = 3 replicas.
+    // = 1,728 tok/s per replica; throughput alone would serve floor(1728 * 0.8 / 20) = 69
+    // users (3 replicas). But GPU memory binds first: KV cache = 70B * 0.0043 MiB * 4096
+    // tokens = 1,232.896 MiB per conversation; (80 - 40) GB * 0.85 = 34 GiB = 34,816 MiB
+    // headroom -> floor(28.24) = 28 conversations per replica -> min(69, 28) = 28
+    // -> ceil(200 / 28) = ceil(7.14) = 8 replicas.
     await waitFor(() => {
-      expect(screen.getByText(/sized to comfortably handle 200 people at once/i)).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          /sized to handle 200 people at once - limited by GPU memory for concurrent conversations/i,
+        ),
+      ).toBeInTheDocument();
     });
-    expect(screen.getByText("3 GPUs")).toBeInTheDocument();
+    expect(screen.getByText("8 GPUs")).toBeInTheDocument();
+    // The memory-bound case also explains what to do about it
+    expect(screen.getByText(/limited by GPU memory:/i)).toBeInTheDocument();
     // 40GB (4-bit) model on an 80GB H100 has plenty of headroom - no VRAM warning here
     // (see calculations.test.ts for dedicated tight-VRAM warning coverage).
     expect(screen.queryByText(/leaves little spare VRAM for request concurrency/i)).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /24\/7 always-on/i }));
     expect(screen.getByText("~730 active hours/month")).toBeInTheDocument();
+  });
+
+  it("shows the one-time hardware purchase separately from the monthly cost for owned hardware", async () => {
+    const user = userEvent.setup();
+    renderHome();
+
+    await waitFor(() => {
+      expect(screen.getByText(/server capacity used/i)).toBeInTheDocument();
+    });
+    // Cloud rental has no one-time purchase
+    expect(screen.queryByText("Hardware purchase (one-time)")).not.toBeInTheDocument();
+    // Catalog captions no longer claim a fixed AWS on-demand assumption
+    expect(screen.queryByText(/AWS on-demand/i)).not.toBeInTheDocument();
+    expect(
+      screen.getAllByText("on its recommended GPU, with your current hosting settings").length,
+    ).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("radio", { name: /own server/i }));
+
+    // Llama 3.3 70B on its own A100-80GB: 1 GPU * $17,000 * 1.4 server overhead
+    // = $23,800 one-time; / 36 months = $661.11/mo amortized.
+    await waitFor(() => {
+      expect(screen.getByText("Hardware purchase (one-time)")).toBeInTheDocument();
+    });
+    expect(screen.getByText("$23,800")).toBeInTheDocument();
+    // Ongoing: 0.4 kW * 1.4 PUE * 217.26 h * $0.14 = $17.03 power
+    // + ($661.11 + $17.03) * 0.25 ops = $169.54 -> $186.57 -> "$187"
+    expect(screen.getByText("Ongoing monthly cost")).toBeInTheDocument();
+    expect(screen.getAllByText("$187").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/assume an upfront cash purchase with straight-line depreciation/i)).toBeInTheDocument();
   });
 
   it("offers Batch API pricing on the API tab", async () => {
