@@ -131,6 +131,102 @@ describe("Home (calculator page)", () => {
     expect(screen.queryByText(/server capacity used/i)).not.toBeInTheDocument();
   });
 
+  it("acceptance: routing's High tier uses the same GPU/price as the non-routed breakdown by default", async () => {
+    const user = userEvent.setup();
+    renderHome();
+
+    await waitFor(() => {
+      expect(screen.getByText(/server capacity used/i)).toBeInTheDocument();
+    });
+    // Default: AWS, which has no A100-80GB for Llama 3.3 70B, so AWS's own most capable
+    // instance is used: 1 H100 (p5.48xlarge) * $6.88/hr * 730h = $5,022.40 rental
+    // + 25% ops $1,255.60 = $6,278.00/mo.
+    expect(screen.getByText("Llama 3.3 70B on AWS (H100-80GB)")).toBeInTheDocument();
+    const nonRoutedTotal = screen.getByText("Total").parentElement!.nextElementSibling!.textContent;
+    expect(nonRoutedTotal).toBe("$6,278");
+
+    await user.click(screen.getByRole("switch", { name: /enable smart routing/i }));
+    await waitFor(() => {
+      expect(screen.getByText("Router (Laya)")).toBeInTheDocument();
+    });
+
+    // High tier (250 docs, still a 1-GPU minimum footprint) and the "always use High"
+    // baseline both now price the SAME AWS H100 - previously they silently jumped to
+    // Azure's A100-80GB: $3.673 * 730 * 1.25 = $3,351.61 -> "$3,352".
+    const highTierValue = screen
+      .getByText("Llama 3.3 70B (High)")
+      .parentElement!.nextElementSibling!.textContent;
+    expect(highTierValue).toBe(nonRoutedTotal);
+    expect(screen.getByText(/Llama 3\.3 70B alone \(\$6,278\/mo\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/\$3,352/)).not.toBeInTheDocument();
+  });
+
+  it("regression: a manually picked GPU for the main model also applies to routing's High tier", async () => {
+    const user = userEvent.setup();
+    renderHome();
+
+    await waitFor(() => {
+      expect(screen.getByText(/server capacity used/i)).toBeInTheDocument();
+    });
+    // Manually override the recommended GPU with AWS's A100-40GB (p4d.24xlarge).
+    await user.click(screen.getByText("p4d.24xlarge").closest("button")!);
+    // 1 A100-40GB * $2.7447/hr * 730h = $2,003.63 rental + 25% ops = $2,504.54 -> "$2,505"
+    await waitFor(() => {
+      expect(screen.getByText("Llama 3.3 70B on AWS (A100-40GB)")).toBeInTheDocument();
+    });
+    const nonRoutedTotal = screen.getByText("Total").parentElement!.nextElementSibling!.textContent;
+    expect(nonRoutedTotal).toBe("$2,505");
+
+    await user.click(screen.getByRole("switch", { name: /enable smart routing/i }));
+    await waitFor(() => {
+      expect(screen.getByText("Router (Laya)")).toBeInTheDocument();
+    });
+    const highTierValue = screen
+      .getByText("Llama 3.3 70B (High)")
+      .parentElement!.nextElementSibling!.textContent;
+    expect(highTierValue).toBe("$2,505");
+    expect(screen.getByText(/Llama 3\.3 70B alone \(\$2,505\/mo\)/)).toBeInTheDocument();
+  });
+
+  it("regression: API catalog card prices include the data-residency premium once it auto-applies", async () => {
+    const user = userEvent.setup();
+    renderHome();
+
+    await waitFor(() => {
+      expect(screen.getByText("per month")).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole("tab", { name: /pay-per-use API/i }));
+    await waitFor(() => {
+      expect(screen.getByText("Input tokens")).toBeInTheDocument();
+    });
+
+    const selectedCardPrice = () => {
+      const card = screen
+        .getAllByRole("button", { pressed: true })
+        .find((el) => el.textContent?.includes("per document"))!;
+      // "$X" + "/mo" share one <p>; strip the suffix.
+      return card.querySelector("p.text-lg")!.textContent!.replace("/mo", "");
+    };
+    const breakdownTotal = () => screen.getByText("per month").previousSibling!.textContent;
+
+    // Single region, no residency: card and breakdown agree.
+    const cardBefore = selectedCardPrice();
+    expect(cardBefore).toBe(breakdownTotal());
+
+    // A second compliance region auto-applies the 10% data-residency premium to the
+    // breakdown; the selected model's catalog card must now show the same total
+    // (previously it stayed at the un-premiumed price, ~10% too low).
+    await user.click(screen.getByRole("button", { name: "European Union" }));
+    await waitFor(
+      () => {
+        expect(screen.getByText("By region")).toBeInTheDocument();
+      },
+      { timeout: 8000 },
+    );
+    expect(breakdownTotal()).not.toBe(cardBefore);
+    expect(selectedCardPrice()).toBe(breakdownTotal());
+  });
+
   it("explains the GPU sizing and switches to a live-users usage pattern", async () => {
     const user = userEvent.setup();
     renderHome();

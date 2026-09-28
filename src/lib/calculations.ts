@@ -352,6 +352,7 @@ export function calculateSelfHostCost(
 
   return {
     modelId: model.id,
+    hostingKind: hostParams.kind,
     requiredThroughputTokPerSec,
     gpuThroughputTokPerSec,
     replicas,
@@ -376,6 +377,25 @@ export function calculateSelfHostCost(
 }
 
 /**
+ * Splits a whole-unit count (calls or documents) across the High / Medium /
+ * Low routing tiers. High and Medium are each rounded from their rate, which
+ * can independently both round up at a .5 boundary (e.g. 999 * 0.5 = 499.5
+ * twice -> 500 + 500 = 1000 > 999). Medium is therefore capped at whatever
+ * High leaves, so high + medium + low === total always holds exactly and no
+ * phantom unit is ever priced.
+ */
+export function splitTierCounts(
+  total: number,
+  highRatePct: number,
+  mediumRatePct: number,
+): { high: number; medium: number; low: number } {
+  const high = Math.min(total, Math.max(0, Math.round(total * highRatePct)));
+  const medium = Math.min(total - high, Math.max(0, Math.round(total * mediumRatePct)));
+  const low = total - high - medium;
+  return { high, medium, low };
+}
+
+/**
  * Models a Jev/Laya-style pre-classification router: every request is first
  * scored by a cheap/fast router, which escalates a configurable share of
  * requests to a "High" (hard/complex) model, an optional "Medium" model, and
@@ -394,11 +414,13 @@ export function calculateRoutedApiCost(
   const { inputTokensPerCall, outputTokensPerCall } = getMonthlyTokenVolume(workload);
   const totalCalls = workload.docsPerMonth * workload.callsPerDoc;
 
-  const escalatedCalls = Math.round(totalCalls * escalationRatePct);
   // Medium can never eat into the High share; clamp so Low never goes negative.
   const clampedMediumRatePct = mediumModel ? Math.max(0, Math.min(mediumRatePct, 1 - escalationRatePct)) : 0;
-  const mediumCalls = mediumModel ? Math.round(totalCalls * clampedMediumRatePct) : 0;
-  const routedCalls = Math.max(0, totalCalls - escalatedCalls - mediumCalls);
+  const {
+    high: escalatedCalls,
+    medium: mediumCalls,
+    low: routedCalls,
+  } = splitTierCounts(totalCalls, escalationRatePct, mediumModel ? clampedMediumRatePct : 0);
 
   const costForCalls = (calls: number, model: CommercialModel) =>
     priceApiTokens(workload, model, calls * inputTokensPerCall, calls * outputTokensPerCall).totalCost;
@@ -538,12 +560,14 @@ export function calculateRoutedSelfHostCost(
   mediumRatePct = 0,
 ): RoutedSelfHostCostBreakdown {
   const totalDocs = workload.docsPerMonth;
-  const highDocs = Math.round(totalDocs * escalationRatePct);
   const clampedMediumRatePct = mediumTier
     ? Math.max(0, Math.min(mediumRatePct, 1 - escalationRatePct))
     : 0;
-  const mediumDocs = mediumTier ? Math.round(totalDocs * clampedMediumRatePct) : 0;
-  const lowDocs = Math.max(0, totalDocs - highDocs - mediumDocs);
+  const {
+    high: highDocs,
+    medium: mediumDocs,
+    low: lowDocs,
+  } = splitTierCounts(totalDocs, escalationRatePct, clampedMediumRatePct);
   // Each tier also serves the same proportional share of peak concurrent
   // users (simple proportional split, same as document volume).
   const lowSharePct = Math.max(0, 1 - escalationRatePct - clampedMediumRatePct);
@@ -613,10 +637,12 @@ export function calculateRoutedSelfHostCost(
 }
 
 /**
- * Scales a per-region routed self-host breakdown by that region's GPU price
- * multiplier (each tier's compute/electricity/overhead scales; the router's
- * flat infra fee is charged per region as-is, matching how compliance
- * deployments provision independent infrastructure per region).
+ * Scales a per-region routed self-host breakdown by that region's GPU-rental
+ * price multiplier (each tier is scaled via scaleSelfHostBreakdown, so only
+ * cloud rental scales; the router's flat infra fee is charged per region
+ * as-is, matching how compliance deployments provision independent
+ * infrastructure per region). The "always use High" baseline follows the
+ * High tier's hosting kind.
  */
 export function scaleRoutedSelfHostBreakdown(
   breakdown: RoutedSelfHostCostBreakdown,
@@ -629,7 +655,8 @@ export function scaleRoutedSelfHostBreakdown(
   }));
   const tiersCost = tiers.reduce((sum, t) => sum + t.breakdown.totalMonthlyCost, 0);
   const totalMonthlyCost = tiersCost + breakdown.routerCost;
-  const baselineCost = breakdown.baselineCost * multiplier;
+  const highTierKind = breakdown.tiers.find((t) => t.tier === "high")?.breakdown.hostingKind ?? "cloud";
+  const baselineCost = breakdown.baselineCost * regionalRentalMultiplierFor(highTierKind, multiplier);
   const savingsAmount = baselineCost - totalMonthlyCost;
 
   return {
@@ -696,23 +723,52 @@ export function withDataResidencyPremium(model: CommercialModel, premiumPct: num
 }
 
 /**
- * Scales an already-computed self-host breakdown by a regional cost
- * multiplier (representing higher GPU rental/hosting costs in that region),
- * recomputing the totals that derive from the scaled components.
+ * The multiplier a regional GPU-rental price multiplier actually implies for
+ * a deployment of the given hosting kind. It reflects cloud GPU RENTAL market
+ * pricing, so it applies to cloud rental only - an owned server's purchase
+ * price (and its amortized slice) doesn't follow rental rates, and there is
+ * no regional electricity-price concept in the model, so owned hardware is
+ * left unscaled.
+ */
+function regionalRentalMultiplierFor(hostingKind: SelfHostCostBreakdown["hostingKind"], multiplier: number): number {
+  return hostingKind === "cloud" ? multiplier : 1;
+}
+
+/**
+ * Scales an already-computed self-host breakdown by a regional GPU-rental
+ * price multiplier, recomputing the totals that derive from the scaled
+ * components. Only cloud GPU rental is scaled (see
+ * regionalRentalMultiplierFor); owned hardware's capex, amortized
+ * depreciation, electricity and the ops overhead derived from them are
+ * returned unchanged.
  */
 export function scaleSelfHostBreakdown(
   breakdown: SelfHostCostBreakdown,
   multiplier: number,
   regionalDocsPerMonth: number,
 ): SelfHostCostBreakdown {
-  const computeCostMonthly = breakdown.computeCostMonthly * multiplier;
-  const electricityCostMonthly = breakdown.electricityCostMonthly * multiplier;
-  const overheadCostMonthly = breakdown.overheadCostMonthly * multiplier;
+  const rentalMultiplier = regionalRentalMultiplierFor(breakdown.hostingKind, multiplier);
+  // Cloud: computeCostMonthly is GPU rental, so it scales. Owned: it is
+  // amortized hardware purchase, so rentalMultiplier is 1.
+  const computeCostMonthly = breakdown.computeCostMonthly * rentalMultiplier;
+  // Electricity is 0 for cloud (bundled into rental) and not tied to GPU
+  // rental pricing for owned hardware - never scaled.
+  const electricityCostMonthly = breakdown.electricityCostMonthly;
+  // Ops overhead is a fixed % of (compute + electricity), so it follows
+  // whatever its inputs became.
+  const baseOverheadInputs = breakdown.computeCostMonthly + breakdown.electricityCostMonthly;
+  const overheadCostMonthly =
+    baseOverheadInputs > 0
+      ? breakdown.overheadCostMonthly * ((computeCostMonthly + electricityCostMonthly) / baseOverheadInputs)
+      : breakdown.overheadCostMonthly;
   const totalMonthlyCost = computeCostMonthly + electricityCostMonthly + overheadCostMonthly;
-  // Both new cost fields are linear in the same components, so they scale by
-  // the same regional multiplier.
-  const hardwareCostOneTimeUsd = breakdown.hardwareCostOneTimeUsd * multiplier;
-  const recurringMonthlyCostExclHardware = breakdown.recurringMonthlyCostExclHardware * multiplier;
+  // One-time purchase price doesn't follow regional rental rates (and is 0
+  // for cloud anyway).
+  const hardwareCostOneTimeUsd = breakdown.hardwareCostOneTimeUsd;
+  // Same invariant calculateSelfHostCost establishes: owned strips out the
+  // amortized hardware slice; cloud is fully recurring.
+  const recurringMonthlyCostExclHardware =
+    totalMonthlyCost - (breakdown.hostingKind === "owned" ? computeCostMonthly : 0);
 
   return {
     ...breakdown,
@@ -837,6 +893,7 @@ export function aggregateSelfHostBreakdowns(
 
   return {
     modelId: first?.modelId ?? "",
+    hostingKind: first?.hostingKind ?? "cloud",
     requiredThroughputTokPerSec,
     gpuThroughputTokPerSec: first?.gpuThroughputTokPerSec ?? 0,
     replicas: sum((b) => b.replicas),

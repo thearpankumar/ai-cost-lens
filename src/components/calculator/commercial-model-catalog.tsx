@@ -13,7 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { IntelligenceMeter, PriceTierBadge, SpeedBadge } from "@/components/calculator/rating-widgets";
-import { calculateApiCost } from "@/lib/calculations";
+import { calculateApiCost, withDataResidencyPremium } from "@/lib/calculations";
 import { providerLogos } from "@/lib/data/logos";
 import { formatUsd } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -26,6 +26,9 @@ interface CommercialModelCatalogProps {
   workload: WorkloadInputs;
   selectedId: string;
   onSelect: (id: string) => void;
+  // Data-residency premium currently in effect (0 when off). Applied the same
+  // way as the real breakdown panels so card prices match the page total.
+  dataResidencyPremiumPct?: number;
 }
 
 export function CommercialModelCatalog({
@@ -33,6 +36,7 @@ export function CommercialModelCatalog({
   workload,
   selectedId,
   onSelect,
+  dataResidencyPremiumPct = 0,
 }: CommercialModelCatalogProps) {
   const [sort, setSort] = useState<SortMode>("cheapest");
   const [taskFilterOn, setTaskFilterOn] = useState(true);
@@ -48,7 +52,7 @@ export function CommercialModelCatalog({
   const rows = useMemo(() => {
     const withCost = filteredModels.map((model) => ({
       model,
-      cost: calculateApiCost(workload, model),
+      cost: calculateApiCost(workload, withDataResidencyPremium(model, dataResidencyPremiumPct)),
     }));
 
     return withCost.sort((a, b) => {
@@ -57,7 +61,7 @@ export function CommercialModelCatalog({
       const speedRank = { fast: 0, medium: 1, slow: 2 } as const;
       return speedRank[a.model.speedTier] - speedRank[b.model.speedTier];
     });
-  }, [filteredModels, workload, sort]);
+  }, [filteredModels, workload, sort, dataResidencyPremiumPct]);
 
   return (
     <div className="space-y-3 @container">

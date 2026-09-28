@@ -20,6 +20,7 @@ import {
   scaleRoutedSelfHostBreakdown,
   scaleSelfHostBreakdown,
   splitDocsAcrossRegions,
+  splitTierCounts,
   withDataResidencyPremium,
   withWorkloadShare,
   type HostParams,
@@ -40,6 +41,7 @@ import { GPU_INSTANCES, OWN_SERVER_DEFAULTS, OWNED_GPU_SPECS } from "@/lib/data/
 import { COMMERCIAL_MODELS } from "@/lib/data/commercial-models";
 import { OPEN_SOURCE_MODELS } from "@/lib/data/opensource-models";
 import { ROUTER_TOKENS_PER_DECISION } from "@/lib/data/routing";
+import { REGIONS } from "@/lib/data/regions";
 import type {
   CommercialModel,
   GpuInstance,
@@ -415,7 +417,7 @@ describe("calculateSelfHostCost - cloud rental has no one-time hardware cost", (
     expect(result.recurringMonthlyCostExclHardware).toBe(result.totalMonthlyCost);
   });
 
-  it("scales and aggregates the capex/recurring fields like the other cost fields", () => {
+  it("keeps owned capex/recurring fields out of regional rental scaling, and aggregates them", () => {
     const owned: HostParams = {
       kind: "owned",
       ownedGpu: syntheticOwnedGpu,
@@ -425,10 +427,11 @@ describe("calculateSelfHostCost - cloud rental has no one-time hardware cost", (
     const regionA = calculateSelfHostCost({ ...baseWorkload, docsPerMonth: 400 }, syntheticOpenSourceModel, owned);
     const regionB = calculateSelfHostCost({ ...baseWorkload, docsPerMonth: 600 }, syntheticOpenSourceModel, owned);
 
-    // Regional multiplier 1.3: $14,000 -> $18,200 one-time
+    // A 1.3x GPU-RENTAL multiplier doesn't apply to a hardware purchase:
+    // $14,000 one-time stays $14,000 (previously wrongly inflated to $18,200).
     const scaled = scaleSelfHostBreakdown(regionA, 1.3, 400);
-    expect(scaled.hardwareCostOneTimeUsd).toBeCloseTo(18_200, 6);
-    expect(scaled.recurringMonthlyCostExclHardware).toBeCloseTo(regionA.recurringMonthlyCostExclHardware * 1.3, 6);
+    expect(scaled.hardwareCostOneTimeUsd).toBeCloseTo(14_000, 6);
+    expect(scaled.recurringMonthlyCostExclHardware).toBeCloseTo(regionA.recurringMonthlyCostExclHardware, 6);
     expect(scaled.recurringMonthlyCostExclHardware).toBeCloseTo(
       scaled.totalMonthlyCost - scaled.computeCostMonthly,
       6,
@@ -589,6 +592,27 @@ describe("calculateRoutedApiCost - three-tier (Low/Medium/High)", () => {
     expect(result.routedCalls).toBeGreaterThanOrEqual(0);
   });
 
+  it("regression: tiers sum to exactly totalCalls even when both roundings hit a .5 boundary", () => {
+    // 999 calls, High 50%, Medium 50% (already at the 1 - 0.5 clamp):
+    // round(499.5) = 500 High, and independently round(499.5) = 500 Medium would be
+    // 1,000 > 999 - a phantom call. Medium is now capped at 999 - 500 = 499, Low = 0.
+    const result = calculateRoutedApiCost(
+      { ...baseWorkload, docsPerMonth: 999 },
+      bigModel,
+      smallModel,
+      jevRouter,
+      0.5,
+      mediumModel,
+      0.5,
+    );
+    expect(result.totalCalls).toBe(999);
+    expect(result.escalatedCalls).toBe(500);
+    expect(result.mediumCalls).toBe(499);
+    expect(result.routedCalls).toBe(0);
+    expect(result.escalatedCalls + result.mediumCalls + result.routedCalls).toBe(999);
+    expect(result.smallModelCost).toBe(0);
+  });
+
   it("aggregates the medium tier correctly across regions", () => {
     const regionA = calculateRoutedApiCost({ ...baseWorkload, docsPerMonth: 400 }, bigModel, smallModel, jevRouter, 0.25, mediumModel, 0.2);
     const regionB = calculateRoutedApiCost({ ...baseWorkload, docsPerMonth: 600 }, bigModel, smallModel, jevRouter, 0.25, mediumModel, 0.2);
@@ -615,6 +639,22 @@ describe("getModelsCheaperThan", () => {
   it("returns an empty list when the reference model is already the cheapest", () => {
     const result = getModelsCheaperThan(baseWorkload, [bigModel, smallModel, mediumModel], smallModel);
     expect(result).toHaveLength(0);
+  });
+});
+
+describe("splitTierCounts", () => {
+  it("always sums to exactly the total, including at .5 rounding boundaries", () => {
+    expect(splitTierCounts(999, 0.5, 0.5)).toEqual({ high: 500, medium: 499, low: 0 });
+    expect(splitTierCounts(1000, 0.25, 0.2)).toEqual({ high: 250, medium: 200, low: 550 });
+    // 3 * 0.5 = 1.5 -> 2 High; Medium round(1.5) = 2 capped to 1; Low 0
+    expect(splitTierCounts(3, 0.5, 0.5)).toEqual({ high: 2, medium: 1, low: 0 });
+    for (const total of [0, 1, 3, 7, 99, 999, 1001]) {
+      for (const high of [0, 0.1, 0.25, 0.5, 0.75, 1]) {
+        const { high: h, medium: m, low: l } = splitTierCounts(total, high, 1 - high);
+        expect(h + m + l).toBe(total);
+        expect(Math.min(h, m, l)).toBeGreaterThanOrEqual(0);
+      }
+    }
   });
 });
 
@@ -673,6 +713,46 @@ describe("scaleSelfHostBreakdown", () => {
   it("leaves the breakdown unchanged at a 1.0 multiplier", () => {
     const scaled = scaleSelfHostBreakdown(base, 1.0, baseWorkload.docsPerMonth);
     expect(scaled.totalMonthlyCost).toBeCloseTo(base.totalMonthlyCost, 6);
+  });
+
+  it("regression: applies the GPU-rental multiplier to cloud rental only, never to owned hardware", () => {
+    const owned = calculateSelfHostCost(baseWorkload, syntheticOpenSourceModel, {
+      kind: "owned",
+      ownedGpu: syntheticOwnedGpu,
+      opsOverheadPct: 0.3,
+      depreciationYears: 2,
+    });
+    const eu = REGIONS.find((r) => r.id === "eu")!; // 1.19x
+    const australia = REGIONS.find((r) => r.id === "australia")!; // 1.33x
+    expect(eu.gpuPriceMultiplier).not.toBe(australia.gpuPriceMultiplier);
+
+    const ownedEu = scaleSelfHostBreakdown(owned, eu.gpuPriceMultiplier, 1000);
+    const ownedAu = scaleSelfHostBreakdown(owned, australia.gpuPriceMultiplier, 1000);
+    // Owned: 1 GPU * $10,000 * 1.4 = $14,000 one-time in BOTH regions
+    // (previously EU $16,660 / Australia $18,620).
+    expect(ownedEu.hardwareCostOneTimeUsd).toBeCloseTo(14_000, 6);
+    expect(ownedAu.hardwareCostOneTimeUsd).toBe(ownedEu.hardwareCostOneTimeUsd);
+    // 0.42 kW * 217.2619 h * $0.14 = $12.775 power in BOTH regions
+    expect(ownedEu.electricityCostMonthly).toBeCloseTo(12.775, 3);
+    expect(ownedAu.electricityCostMonthly).toBe(ownedEu.electricityCostMonthly);
+    // Amortized $583.33 + $12.775 power + ops ($596.11 * 0.3 = $178.83) = $774.94/mo, both regions
+    expect(ownedEu.computeCostMonthly).toBeCloseTo(14_000 / 24, 6);
+    expect(ownedEu.totalMonthlyCost).toBeCloseTo(774.9408, 3);
+    expect(ownedAu.totalMonthlyCost).toBe(ownedEu.totalMonthlyCost);
+    // Capex/opex invariant still holds after scaling
+    expect(ownedAu.recurringMonthlyCostExclHardware).toBeCloseTo(
+      ownedAu.totalMonthlyCost - ownedAu.computeCostMonthly,
+      6,
+    );
+
+    // Cloud rental still scales: $2,190 rental * 1.33 = $2,912.70; ops 25% -> $3,640.875
+    const cloudAu = scaleSelfHostBreakdown(base, australia.gpuPriceMultiplier, 1000);
+    expect(cloudAu.computeCostMonthly).toBeCloseTo(2190 * 1.33, 6);
+    expect(cloudAu.overheadCostMonthly).toBeCloseTo(2190 * 1.33 * 0.25, 6);
+    expect(cloudAu.totalMonthlyCost).toBeCloseTo(3640.875, 6);
+    expect(cloudAu.electricityCostMonthly).toBe(0);
+    expect(cloudAu.hardwareCostOneTimeUsd).toBe(0);
+    expect(cloudAu.recurringMonthlyCostExclHardware).toBe(cloudAu.totalMonthlyCost);
   });
 });
 
@@ -837,6 +917,27 @@ describe("calculateRoutedSelfHostCost", () => {
     expect(low.docsPerMonth).toBeGreaterThanOrEqual(0);
   });
 
+  it("regression: tier documents sum to exactly totalDocs even when both roundings hit a .5 boundary", () => {
+    // 999 docs, High 50%, Medium 50%: round(499.5) = 500 High; Medium capped at 499
+    // (was 500, giving 1,000 docs priced for a 999-doc workload); Low = 0.
+    const result = calculateRoutedSelfHostCost(
+      { ...baseWorkload, docsPerMonth: 999 },
+      highTier,
+      lowTier,
+      laya,
+      0.5,
+      mediumTier,
+      0.5,
+    );
+    const high = result.tiers.find((t) => t.tier === "high")!;
+    const medium = result.tiers.find((t) => t.tier === "medium")!;
+    const low = result.tiers.find((t) => t.tier === "low")!;
+    expect(high.docsPerMonth).toBe(500);
+    expect(medium.docsPerMonth).toBe(499);
+    expect(low.docsPerMonth).toBe(0);
+    expect(high.docsPerMonth + medium.docsPerMonth + low.docsPerMonth).toBe(999);
+  });
+
   it("sums GPUs needed across all active tiers", () => {
     const result = calculateRoutedSelfHostCost(baseWorkload, highTier, lowTier, laya, 0.25);
     const high = result.tiers.find((t) => t.tier === "high")!;
@@ -859,6 +960,29 @@ describe("scaleRoutedSelfHostBreakdown and aggregateRoutedSelfHostBreakdowns", (
     expect(scaled.routerCost).toBe(base.routerCost);
     expect(scaled.totalMonthlyCost).toBeCloseTo(scaledTiersCost + base.routerCost, 5);
     expect(scaled.baselineCost).toBeCloseTo(base.baselineCost * 1.3, 5);
+  });
+
+  it("regression: does not scale owned-hardware tiers or the owned baseline by the rental multiplier", () => {
+    const ownedParams: HostParams = {
+      kind: "owned",
+      ownedGpu: syntheticOwnedGpu,
+      opsOverheadPct: 0.3,
+      depreciationYears: 2,
+    };
+    const base = calculateRoutedSelfHostCost(
+      baseWorkload,
+      { model: highOssModel, hostParams: ownedParams },
+      { model: lowOssModel, hostParams: ownedParams },
+      laya,
+      0.25,
+    );
+    const scaled = scaleRoutedSelfHostBreakdown(base, 1.33, baseWorkload.docsPerMonth);
+    expect(scaled.totalMonthlyCost).toBeCloseTo(base.totalMonthlyCost, 6);
+    expect(scaled.baselineCost).toBe(base.baselineCost);
+    scaled.tiers.forEach((t, i) => {
+      expect(t.breakdown.hardwareCostOneTimeUsd).toBe(base.tiers[i].breakdown.hardwareCostOneTimeUsd);
+      expect(t.breakdown.electricityCostMonthly).toBe(base.tiers[i].breakdown.electricityCostMonthly);
+    });
   });
 
   it("aggregates multiple regions into one internally-consistent total", () => {

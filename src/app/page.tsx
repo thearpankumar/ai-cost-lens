@@ -51,7 +51,16 @@ import { COMMERCIAL_MODELS } from "@/lib/data/commercial-models";
 import { DEFAULT_CAPACITY_PROFILE } from "@/lib/data/constants";
 import { UsagePatternPanel } from "@/components/calculator/usage-pattern-panel";
 import type { ContextWindowWarning } from "@/components/calculator/breakdown-panel";
-import type { CalcMode, RegionAllocation, RegionId, RoutingConfig, WorkloadInputs } from "@/lib/types";
+import type {
+  CalcMode,
+  CloudProvider,
+  GpuInstance,
+  GpuType,
+  RegionAllocation,
+  RegionId,
+  RoutingConfig,
+  WorkloadInputs,
+} from "@/lib/types";
 
 const DEFAULT_WORKLOAD: WorkloadInputs = {
   docsPerMonth: 1000,
@@ -98,20 +107,30 @@ const DEFAULT_SELF_HOST_ROUTING_CONFIG: RoutingConfig = {
   mediumRatePct: 0,
 };
 
+/**
+ * The instance a model should run on within ONE cloud provider: an exact
+ * match for the model's recommended GPU type if that cloud offers it,
+ * otherwise that same cloud's most capable option (by VRAM) rather than
+ * whichever happens to be first in the list - so we never silently
+ * under-provision VRAM, and never silently jump to a different provider
+ * than the one the user chose.
+ */
+function recommendedInstanceOnCloud(cloud: CloudProvider, gpuType: GpuType): GpuInstance {
+  const match = GPU_INSTANCES.find((i) => i.cloud === cloud && i.gpuType === gpuType);
+  if (match) return match;
+  return [...GPU_INSTANCES]
+    .filter((i) => i.cloud === cloud)
+    .sort((a, b) => GPU_VRAM_GB[b.gpuType] - GPU_VRAM_GB[a.gpuType])[0];
+}
+
 function defaultHostConfig(): SelfHostConfig {
   const model = OPEN_SOURCE_MODELS.find((m) => m.id === DEFAULT_OPEN_SOURCE_MODEL_ID)!;
-  const awsMatch = GPU_INSTANCES.find((i) => i.cloud === "AWS" && i.gpuType === model.minGpuType);
-  // AWS doesn't offer every GPU type (e.g. no A100-80GB) - if there's no
-  // exact match, fall back to AWS's most capable option rather than
-  // whichever happens to be first in the list, so the default view doesn't
-  // silently under-provision VRAM for the default model.
-  const awsFallback = [...GPU_INSTANCES]
-    .filter((i) => i.cloud === "AWS")
-    .sort((a, b) => GPU_VRAM_GB[b.gpuType] - GPU_VRAM_GB[a.gpuType])[0];
+  // AWS doesn't offer every GPU type (e.g. no A100-80GB), in which case this
+  // falls back to AWS's own most capable option.
   return {
     location: "cloud",
     cloudProvider: "AWS",
-    gpuInstanceId: (awsMatch ?? awsFallback)!.id,
+    gpuInstanceId: recommendedInstanceOnCloud("AWS", model.minGpuType).id,
     useReservedPricing: false,
     scaleDownOutsideActiveHours: false,
     ownedGpuType: model.minGpuType,
@@ -174,26 +193,51 @@ export default function Home() {
 
   const selectedGpuInstance = GPU_INSTANCES.find((i) => i.id === hostConfig.gpuInstanceId)!;
 
+  // The hosting the user has ACTUALLY configured in the HostingSelector for
+  // the main model (including any manually picked, non-recommended GPU).
+  const hostParams: HostParams = useMemo(() => {
+    if (hostConfig.location === "cloud") {
+      return {
+        kind: "cloud",
+        gpuInstance: selectedGpuInstance,
+        useReservedPricing: hostConfig.useReservedPricing,
+        scaleDownOutsideActiveHours: hostConfig.scaleDownOutsideActiveHours,
+        opsOverheadPct: hostConfig.opsOverheadPct,
+      };
+    }
+    const ownedSpec = OWNED_GPU_SPECS.find((s) => s.gpuType === hostConfig.ownedGpuType)!;
+    return {
+      kind: "owned",
+      ownedGpu: ownedSpec,
+      opsOverheadPct: hostConfig.opsOverheadPct,
+      depreciationYears: hostConfig.depreciationYears,
+    };
+  }, [hostConfig, selectedGpuInstance]);
+
   // Derives hosting for any open-source model (a routing tier, or a catalog
-  // card preview) using the same cloud/pricing settings as the main
-  // HostingSelector, but matched to that model's own recommended GPU type
-  // rather than the main model's. Sharing this one resolver keeps catalog
-  // previews, routing guardrails and the routing baseline consistent.
+  // card preview). Sharing this one resolver keeps catalog previews, routing
+  // guardrails, the routing High tier and the routing baseline consistent.
+  //  - The currently selected main model gets exactly the hosting the user
+  //    configured (hostParams above), so the routed High tier matches the
+  //    non-routed breakdown and honors a manual GPU override.
+  //  - Any other model uses the same cloud/pricing settings, matched to its
+  //    own recommended GPU type on the user's chosen cloud provider (falling
+  //    back to that provider's most capable instance, never another cloud).
   const hostParamsForModel = useCallback(
     (model: (typeof OPEN_SOURCE_MODELS)[number]): HostParams => {
+      if (model.id === selectedOpenSourceModel.id) return hostParams;
       if (hostConfig.location === "cloud") {
-        const match = GPU_INSTANCES.find(
-          (i) => i.cloud === hostConfig.cloudProvider && i.gpuType === model.minGpuType,
-        );
-        const fallback = GPU_INSTANCES.find((i) => i.gpuType === model.minGpuType) ?? selectedGpuInstance;
         return {
           kind: "cloud",
-          gpuInstance: match ?? fallback,
+          gpuInstance: recommendedInstanceOnCloud(hostConfig.cloudProvider, model.minGpuType),
           useReservedPricing: hostConfig.useReservedPricing,
           scaleDownOutsideActiveHours: hostConfig.scaleDownOutsideActiveHours,
           opsOverheadPct: hostConfig.opsOverheadPct,
         };
       }
+      // Owned GPU specs aren't partitioned by provider, so every GPU type is
+      // always available; the user's own ownedGpuType is only needed as a
+      // fallback for a type with no owned spec.
       const ownedSpec =
         OWNED_GPU_SPECS.find((s) => s.gpuType === model.minGpuType) ??
         OWNED_GPU_SPECS.find((s) => s.gpuType === hostConfig.ownedGpuType)!;
@@ -204,7 +248,7 @@ export default function Home() {
         depreciationYears: hostConfig.depreciationYears,
       };
     },
-    [hostConfig, selectedGpuInstance],
+    [hostConfig, hostParams, selectedOpenSourceModel.id],
   );
 
   // Structural guardrail: if the main model changes such that the current
@@ -357,25 +401,6 @@ export default function Home() {
     () => routedAllocations.map((a) => ({ regionId: a.regionId, docsPerMonth: a.docsPerMonth, totalMonthlyCost: a.breakdown.totalMonthlyCost })),
     [routedAllocations],
   );
-
-  const hostParams: HostParams = useMemo(() => {
-    if (hostConfig.location === "cloud") {
-      return {
-        kind: "cloud",
-        gpuInstance: selectedGpuInstance,
-        useReservedPricing: hostConfig.useReservedPricing,
-        scaleDownOutsideActiveHours: hostConfig.scaleDownOutsideActiveHours,
-        opsOverheadPct: hostConfig.opsOverheadPct,
-      };
-    }
-    const ownedSpec = OWNED_GPU_SPECS.find((s) => s.gpuType === hostConfig.ownedGpuType)!;
-    return {
-      kind: "owned",
-      ownedGpu: ownedSpec,
-      opsOverheadPct: hostConfig.opsOverheadPct,
-      depreciationYears: hostConfig.depreciationYears,
-    };
-  }, [hostConfig, selectedGpuInstance]);
 
   const selfHostAllocations = useMemo<RegionAllocation<ReturnType<typeof calculateSelfHostCost>>[]>(
     () =>
@@ -568,6 +593,7 @@ export default function Home() {
                 workload={workload}
                 selectedId={selectedCommercialModel.id}
                 onSelect={setSelectedCommercialId}
+                dataResidencyPremiumPct={effectiveDataResidency ? DATA_RESIDENCY_PREMIUM_PCT : 0}
               />
               <SmartRoutingPanel
                 config={routingConfig}

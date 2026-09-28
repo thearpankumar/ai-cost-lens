@@ -152,6 +152,9 @@ export type SelfHostConcurrencyBound = "throughput" | "vram";
 
 export interface SelfHostCostBreakdown {
   modelId: string;
+  // Whether this deployment rents cloud GPUs or runs on owned hardware.
+  // Regional GPU-rental price multipliers only apply to cloud rental.
+  hostingKind: "cloud" | "owned";
   requiredThroughputTokPerSec: number; // during active hours
   gpuThroughputTokPerSec: number; // aggregate throughput of ONE replica (model.minGpuCount GPUs)
   replicas: number; // independent copies of the model being served
@@ -251,7 +254,7 @@ export interface RegionInfo {
   id: RegionId;
   label: string;
   exampleLocations: string;
-  gpuPriceMultiplier: number; // relative to US baseline, for self-hosted GPU rental
+  gpuPriceMultiplier: number; // relative to US baseline, for cloud GPU rental only (not owned hardware)
   blurb: string;
 }
 
