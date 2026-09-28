@@ -486,12 +486,16 @@ export type ResolveHostParams = (model: OpenSourceModel) => HostParams;
  */
 export function checkContextWindowFit(
   workload: WorkloadInputs,
-  contextWindow: number,
+  model: CommercialModel,
 ): { fits: boolean; nearLimit: boolean; inputTokensPerCall: number } {
-  const { inputTokensPerCall } = getMonthlyTokenVolume(workload);
+  const { inputTokensPerCall: rawInputTokensPerCall } = getMonthlyTokenVolume(workload);
+  // A model's own tokenizer can produce more tokens for the same text (see
+  // getTokenizerMultiplier) - checking the raw, un-adjusted count against its
+  // context window would understate how many tokens a request actually uses.
+  const inputTokensPerCall = Math.round(rawInputTokensPerCall * getTokenizerMultiplier(model));
   return {
-    fits: inputTokensPerCall <= contextWindow,
-    nearLimit: inputTokensPerCall > contextWindow * 0.85,
+    fits: inputTokensPerCall <= model.contextWindow,
+    nearLimit: inputTokensPerCall > model.contextWindow * 0.85,
     inputTokensPerCall,
   };
 }

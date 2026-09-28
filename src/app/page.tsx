@@ -481,7 +481,7 @@ export default function Home() {
   );
 
   const apiContextWarning: ContextWindowWarning | undefined = useMemo(() => {
-    const check = checkContextWindowFit(workload, selectedCommercialModel.contextWindow);
+    const check = checkContextWindowFit(workload, selectedCommercialModel);
     if (check.fits && !check.nearLimit) return undefined;
     return {
       modelName: selectedCommercialModel.name,
@@ -496,7 +496,7 @@ export default function Home() {
       selectedSmallModel.contextWindow < selectedCommercialModel.contextWindow
         ? selectedSmallModel
         : selectedCommercialModel;
-    const check = checkContextWindowFit(workload, tightest.contextWindow);
+    const check = checkContextWindowFit(workload, tightest);
     if (check.fits && !check.nearLimit) return undefined;
     return {
       modelName: tightest.name,

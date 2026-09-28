@@ -8,6 +8,7 @@ import {
   calculateRoutedApiCost,
   calculateRoutedSelfHostCost,
   calculateSelfHostCost,
+  checkContextWindowFit,
   estimateSelfHostMonthlyCost,
   getActiveHoursPerMonth,
   getCloudBilledHoursPerMonth,
@@ -1423,6 +1424,29 @@ describe("Claude tokenizer multiplier", () => {
     expect(result.bigModelCost).toBeCloseTo(5.5475, 5);
     // small model has no multiplier: unchanged from the plain 2-tier case
     expect(result.smallModelCost).toBeCloseTo(0.64785, 5);
+  });
+});
+
+describe("checkContextWindowFit accounts for a model's own tokenizer multiplier", () => {
+  it("uses the raw token count for a model with no tokenizer multiplier", () => {
+    // 8-page "medium" doc -> 5,600 doc tokens + 350 overhead = 5,950 raw input tokens/call
+    const result = checkContextWindowFit(baseWorkload, syntheticCommercialModel);
+    expect(result.inputTokensPerCall).toBe(5950);
+  });
+
+  it("inflates the checked token count by the tokenizer multiplier, matching what's actually billed", () => {
+    // 5,950 raw * 1.3 = 7,735 - matches calculateApiCost's monthlyInputTokens/1000 calls
+    const result = checkContextWindowFit(baseWorkload, { ...syntheticCommercialModel, tokenizerMultiplier: 1.3 });
+    expect(result.inputTokensPerCall).toBe(7735);
+  });
+
+  it("regression: a tighter context window can flip from fitting to exceeding once the multiplier is applied", () => {
+    // contextWindow=7000 sits between the raw (5,950) and multiplier-adjusted (7,735) token
+    // counts - checking the raw count alone would wrongly report this request as fitting.
+    const tightModel = { ...syntheticCommercialModel, contextWindow: 7000, tokenizerMultiplier: 1.3 };
+    const result = checkContextWindowFit(baseWorkload, tightModel);
+    expect(result.inputTokensPerCall).toBe(7735);
+    expect(result.fits).toBe(false);
   });
 });
 

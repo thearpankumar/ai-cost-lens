@@ -6,6 +6,7 @@ import { Separator } from "@/components/ui/separator";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { formatNumber, formatPercent, formatUsd } from "@/lib/format";
+import { aggregateSelfHostBreakdowns } from "@/lib/calculations";
 import type {
   ApiCostBreakdown,
   CommercialModel,
@@ -624,15 +625,25 @@ export function RoutedSelfHostBreakdownPanel({
 
         <div className="space-y-1">
           {(["high", "medium", "low"] as const).map((tierKey) => {
-            const tier = breakdown.tiers.find((t) => t.tier === tierKey);
+            // Tier results repeat once per region - combine every region's
+            // copy of this tier instead of showing only the first region's.
+            const tierEntries = breakdown.tiers.filter((t) => t.tier === tierKey);
             const tierModel = modelsByTier[tierKey];
-            if (!tier || !tierModel) return null;
+            if (tierEntries.length === 0 || !tierModel) return null;
+            const tierDocs = tierEntries.reduce((sum, t) => sum + t.docsPerMonth, 0);
+            const combined = aggregateSelfHostBreakdowns(
+              tierEntries.map((t) => ({
+                regionId: "us" as const,
+                docsPerMonth: t.docsPerMonth,
+                breakdown: t.breakdown,
+              })),
+            );
             return (
               <LineItem
                 key={tierKey}
                 label={`${tierModel.name} (${TIER_LABELS[tierKey]})`}
-                sub={`${formatNumber(tier.docsPerMonth)} of ${formatNumber(totalDocs)} docs/mo · ${gpuCountLabel(tier.breakdown)}, ${describeLimitingFactor(tier.breakdown)}`}
-                value={formatUsd(tier.breakdown.totalMonthlyCost)}
+                sub={`${formatNumber(tierDocs)} of ${formatNumber(totalDocs)} docs/mo · ${gpuCountLabel(combined)}, ${describeLimitingFactor(combined)}`}
+                value={formatUsd(combined.totalMonthlyCost)}
               />
             );
           })}
